@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+protein_spillover_explained.md
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE/editor
+.vscode/
+.idea/
+.positron/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Large scientific data
+*.h5ad
+*.h5mu
+*.zarr/
+*.parquet
+*.csv.gz
+*.npy
+*.npz
+
+# Spillover outputs/checkpoints
+checkpoints/
+report_data/
+qc_plots/
+correction_qc/
+raster_mapping_qc/
+RUN_COMPLETE.json
+*.complete.json
+last_failure.json
+
+# Temporary files
+*.tmp
+.*.tmp

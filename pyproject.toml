@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protein-spillover"
+version = "0.2.0"
+description = "Spatial protein spillover measurement, diagnosis, and correction for Xenium and multiplex imaging"
+readme = "protein_spillover_README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "DV" }
+]
+keywords = [
+  "spatial biology",
+  "spatial proteomics",
+  "multiplex immunofluorescence",
+  "Xenium",
+  "SpatialData",
+  "image analysis",
+  "segmentation",
+  "protein spillover"
+]
+
+dependencies = [
+  "anndata>=0.11.4",
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "scipy>=1.11",
+  "scikit-image>=0.22",
+  "spatialdata>=0.2",
+  "typing-extensions>=4.8",
+  "xarray>=2023.12",
+  "pyarrow>=14.0",
+]
+
+[project.scripts]
+protein-spillover = "protein_spillover_cli:cli_main"
+
+[project.urls]
+Repository = "https://github.com/YOUR_GITHUB_USERNAME/protein-spillover"
+Issues = "https://github.com/YOUR_GITHUB_USERNAME/protein-spillover/issues"
+
+[tool.setuptools]
+py-modules = ["protein_spillover_cli"]

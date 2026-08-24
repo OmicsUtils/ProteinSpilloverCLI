@@ -1,0 +1,10 @@
+anndata>=0.11.4
+matplotlib>=3.8
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+scikit-image>=0.22
+spatialdata>=0.2
+typing-extensions>=4.8
+xarray>=2023.12
+pyarrow>=14.0
