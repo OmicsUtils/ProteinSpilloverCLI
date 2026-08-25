@@ -1,549 +1,47 @@
-# Spatial protein spillover CLI
+Spatial protein spillover CLI
 
-`protein-spillover` is an end-to-end workflow for measuring, diagnosing, and correcting cell-segmentation-associated protein spillover in Xenium and other multiplex protein images stored in `SpatialData`.
+protein-spillover is an end-to-end workflow for measuring and correcting cell-segmentation-associated protein spillover in Xenium and other multiplex protein images stored in SpatialData.
 
-The workflow does more than report one corrected intensity. For every cell and protein, it preserves the original measurement, extracts spatial evidence for possible spillover, evaluates multiple correction scenarios, estimates overcorrection risk, and recommends a corrected value with structured and human-readable reasons.
+The current correction model is intentionally narrow and preservation-first. It is designed primarily to improve immune-lineage protein measurements without using cell-type annotations to decide what a cell should express.
 
-The default correction path is annotation-free. Cell-type labels are optional and are never required.
+The central rule is now:
 
-## What the workflow does
+Correct only protein signal that can be physically supported by a specific cell-cell interface. If the image cannot distinguish intrinsic expression from neighbor-derived signal, preserve the measurement and flag the ambiguity.
 
-The CLI performs the complete pipeline in one program:
+All analyzed proteins remain available in the outputs. Only markers listed in correction_channels are altered by the spillover model.
 
-1. loads the SpatialData table, protein image, label raster, and optional QC mask;
-2. validates the authoritative table-to-raster label mapping;
-3. crops the selected ROI on the verified native image grid;
-4. preprocesses image intensities correctly for generic, precorrected, or Xenium XOA inputs;
-5. extracts whole-cell, interior, boundary, outer-ring, and neighboring-cell protein features;
-6. builds a direct cell-contact graph;
-7. calculates segmentation geometry, local density, and dense-small-cell protection scores;
-8. estimates marker-specific neighbor exposure and likely spillover sources;
-9. evaluates multiple correction scenarios;
-10. recommends a scenario or marks the result unresolved;
-11. saves confidence, overcorrection risk, reason codes, and readable explanations;
-12. writes corrected features into an ROI AnnData object and produces QC reports.
+Current correction model
 
-The input Zarr remains read-only. Results are written only to the configured output directory.
+The current algorithm is immune-pairwise-interface-v1.
 
-## Core assumptions
+For each selected correction marker and each directly contacting cell pair, the workflow:
 
-The workflow is appropriate when all of the following are true:
+identifies the focal-cell pixels belonging to that specific cell-cell interface;
 
-1. The table has one row per segmented biological cell.
-2. A positive integer table column directly identifies the same cell in the label raster.
-3. The protein image and label raster share the same full-resolution native `y × x` grid.
-4. Table spatial coordinates can be related to native image pixels using an axis-aligned transformation consisting of:
-   - one pixel-size scale;
-   - optional x and/or y reflection;
-   - optional global x and y origins.
-5. The original image values should remain available for auditing.
-6. The workflow should not write back into the authoritative SpatialData Zarr.
+assigns each focal interface pixel to at most one neighboring cell;
 
-The CLI does not infer a label crosswalk from centroid matching or polygon overlap. The table label column is treated as authoritative and checked against the cropped label raster.
+measures signal inside the focal interface;
 
-## Files in this distribution
+establishes a localization-appropriate focal-cell reference region;
 
-```text
-protein_spillover_cli.py       Main end-to-end CLI and analysis workflow
-protein_spillover_config.json  Complete configuration template
-protein_spillover_README.md    This guide
-requirements.txt               Dependency list
-pyproject.toml                 Editable installation and console entry point
-```
+checks whether the neighboring cell is a plausible physical source of the marker;
 
-## Installation
+measures only the excess signal observed inside the focal cell relative to its own reference;
 
-Use Python 3.10 or newer in an isolated environment containing the SpatialData stack required by the project.
+converts that excess into a whole-cell-equivalent contamination amount using the fraction of valid focal-cell pixels occupied by the interface;
 
-### Install as a command
+evaluates all configured correction scenarios from the same physically bounded interface evidence;
 
-From the distribution directory:
+automatically recommends only none, conservative, or medium;
 
-```bash
-python -m pip install -e .
-```
+preserves and flags cases where intrinsic signal cannot be distinguished from neighbor-derived signal.
 
-This installs:
+Neighbor brightness is used only to decide whether a neighbor is a plausible source. It does not directly determine how much signal is subtracted from the focal cell.
 
-```bash
-protein-spillover
-```
+What the workflow does
 
-### Run without installing
+The CLI runs fourteen checkpointed stages:
 
-```bash
-python protein_spillover_cli.py --help
-```
-
-### Verify installation
-
-```bash
-protein-spillover --help
-protein-spillover run --help
-```
-
-## First inspect a new project
-
-Use `inspect` before building a production configuration.
-
-```bash
-protein-spillover inspect \
-  --zarr /data/project/spatial_data.zarr
-```
-
-A more detailed inspection:
-
-```bash
-protein-spillover inspect \
-  --zarr /data/project/spatial_data.zarr \
-  --table cell_table \
-  --image morphology_focus \
-  --labels cell_labels \
-  --roi-col roi
-```
-
-Use this output to identify:
-
-- the table name;
-- protein image and label element names;
-- the stable cell-ID column;
-- the authoritative integer raster-label column;
-- the `obsm` key containing x/y coordinates;
-- available protein channels;
-- optional ROI, sample, batch, and annotation columns.
-
-## Create a configuration file
-
-Generate a complete template:
-
-```bash
-protein-spillover template-config \
-  --output protein_spillover_config.json
-```
-
-Run with the configuration:
-
-```bash
-protein-spillover run \
-  --config protein_spillover_config.json
-```
-
-CLI values override JSON values:
-
-```bash
-protein-spillover run \
-  --config protein_spillover_config.json \
-  --roi-value ROI_002 \
-  --outdir /results/protein_spillover/ROI_002
-```
-
-## Minimal direct-argument run
-
-```bash
-protein-spillover run \
-  --zarr /data/project/spatial_data.zarr \
-  --table cell_table \
-  --image morphology_focus \
-  --labels cell_labels \
-  --outdir /results/protein_spillover \
-  --cell-id-col cell_id \
-  --table-label-col cell_labels \
-  --spatial-key spatial \
-  --pixel-size-um 0.2125 \
-  --orientation no_flip \
-  --roi-col roi \
-  --roi-value ROI_001 \
-  --intensity-mode xenium_xoa \
-  --channel CD3E \
-  --channel CD8A
-```
-
-To analyze the full table rather than one ROI:
-
-```bash
-protein-spillover run \
-  --config protein_spillover_config.json \
-  --all-cells
-```
-
-When `roi_col` is configured but no ROI value is supplied, the workflow chooses the ROI whose cell count is closest to the median ROI cell count. This is intended for pilot testing, not for automatic all-ROI processing.
-
-## Required configuration
-
-| JSON key | CLI flag | Meaning |
-|---|---|---|
-| `sdata_zarr_path` | `--zarr` | Input SpatialData Zarr |
-| `table_name` | `--table` | AnnData table stored in SpatialData |
-| `protein_image_name` | `--image` | Multichannel protein image |
-| `cell_labels_name` | `--labels` | Positive-integer cell-label raster |
-| `outdir` | `--outdir` | Output directory |
-| `cell_id_col` | `--cell-id-col` | Stable cell identifier in `table.obs` |
-| `table_cell_label_col` | `--table-label-col` | Authoritative raster label in `table.obs` |
-| `spatial_key` | `--spatial-key` | `table.obsm` key containing x/y coordinates |
-| `native_pixel_size_um` | `--pixel-size-um` | Native pixel size in table coordinate units |
-
-Table label values must be unique positive integers within the selected ROI.
-
-## Image registration
-
-The workflow uses an explicit axis-aligned native-pixel mapping rather than trusting stored transformations.
-
-### Orientation
-
-| Value | Meaning |
-|---|---|
-| `no_flip` | x and y increase with native image indices |
-| `x_flip` | x is reflected |
-| `y_flip` | y is reflected |
-| `xy_flip` | both axes are reflected |
-
-Arbitrary rotation, shear, and nonlinear warping are not supported. Such images should be registered before this workflow runs.
-
-### Pixel size and origins
-
-For `no_flip`:
-
-```text
-x_table = native_origin_x_um + x_native × native_pixel_size_um
-y_table = native_origin_y_um + y_native × native_pixel_size_um
-```
-
-Relevant options:
-
-```text
---pixel-size-um
---origin-x-um
---origin-y-um
---orientation
-```
-
-Before a production run, verify registration on several spatially separated cells.
-
-## ROI behavior
-
-### Named ROI
-
-```json
-{
-  "roi_col": "roi",
-  "pilot_roi": "ROI_001"
-}
-```
-
-### Representative ROI
-
-Set `roi_col` and leave `pilot_roi` as `null`.
-
-### Full table
-
-```json
-{
-  "roi_col": null,
-  "pilot_roi": null
-}
-```
-
-or pass `--all-cells`.
-
-## Channel selection
-
-Select individual channels:
-
-```bash
---channel CD3E --channel CD8A --channel CD20
-```
-
-Use all channels except exclusions:
-
-```json
-"analysis_channels": null,
-"exclude_channels": ["DAPI"]
-```
-
-Repeated CLI channel options replace the JSON list.
-
-## Intensity preprocessing
-
-The workflow supports three modes.
-
-### `xenium_xoa`
-
-Use this for Xenium Onboard Analysis protein images.
-
-XOA protein images are already deconvolved, autofluorescence-background-subtracted, saturation-masked, and spectrally corrected. XOA normally stores these values with a positive offset of 100.
-
-The workflow:
-
-- subtracts the configured XOA storage offset;
-- retains signed offset-adjusted values for intensity summaries;
-- creates a clipped nonnegative signal representation for thresholds and ratios;
-- does not apply a second Gaussian background subtraction.
-
-```json
-{
-  "input_intensity_mode": "xenium_xoa",
-  "xenium_xoa_intensity_offset": 100.0
-}
-```
-
-### `precorrected`
-
-Use supplied values directly as signed analysis intensities.
-
-### `generic_gaussian`
-
-Estimate and subtract a broad Gaussian background for generic multiplex images that have not already been background corrected.
-
-## QC masks
-
-A channel-matched QC-mask image may be supplied.
-
-For Xenium XOA saturation masks, valid pixels are usually 0 and masked pixels are 255.
-
-```json
-{
-  "protein_qc_mask_name": "morphology_focus_qc_masks",
-  "qc_mask_valid_value": 0,
-  "xenium_require_qc_mask": false
-}
-```
-
-Invalid pixels are excluded from intensity summaries, thresholds, directionality metrics, and QC distributions.
-
-## Cell masks and spatial compartments
-
-For every segmented cell, the workflow derives:
-
-- whole cell;
-- eroded interior;
-- internal boundary;
-- outer ring;
-- outer noncell ring;
-- outer other-cell ring.
-
-Configure with:
-
-```bash
---inner-erosion 2
---outer-ring 2
-```
-
-These values are full-resolution native pixels.
-
-## Exploratory positive-pixel thresholds
-
-These thresholds are used for image-localization and directionality evidence. They are not biological protein gates.
-
-Default quantile:
-
-```bash
---threshold-quantile 0.90
-```
-
-Channel-specific quantiles:
-
-```bash
---channel-threshold-quantile CD3E=0.85 \
---channel-threshold-quantile PD1=0.95
-```
-
-Manual image thresholds:
-
-```bash
---manual-threshold CD3E=120
-```
-
-Manual thresholds take precedence.
-
-## Annotation policy
-
-Cell-type labels are optional.
-
-The default is:
-
-```json
-"annotation_mode": "disabled"
-```
-
-Supported modes:
-
-| Mode | Behavior |
-|---|---|
-| `disabled` | Labels do not affect correction or recommendation |
-| `reporting_only` | Labels are copied to outputs only |
-| `validation_only` | Labels are used only in QC summaries |
-| `weak_prior` | Labels may weakly influence recommendation scoring |
-
-The annotation-free result remains the primary technical correction path. Labels should never force a marker to zero or define a correction by themselves.
-
-## Geometry and dense-small-cell protection
-
-The workflow computes per-cell and local-neighborhood features including:
-
-- segmentation area;
-- perimeter and shared-boundary exposure;
-- number of direct contacts;
-- total and maximum shared-boundary edge counts;
-- local neighbor density;
-- small-cell rank;
-- dense-neighborhood rank;
-- dense-small-cell geometry score.
-
-This score is deliberately geometric. It does not claim that a cell is a lymphocyte.
-
-Dense-small-cell protection reduces correction aggressiveness when a cell is small, crowded, and surrounded by several similarly exposed neighbors. This is intended to limit density-dependent overcorrection in lymphocyte-rich regions.
-
-Main settings:
-
-```json
-{
-  "dense_small_cell_area_quantile": 0.35,
-  "dense_neighbor_count_quantile": 0.70,
-  "dense_shared_boundary_quantile": 0.70,
-  "dense_protection_strength": 0.65
-}
-```
-
-## Neighbor exposure and source attribution
-
-For each cell-protein pair, the workflow evaluates directly contacting cells using:
-
-- shared-boundary evidence;
-- neighbor intensity;
-- neighbor-to-focal contrast;
-- dominant-neighbor contribution;
-- top-neighbor contributions;
-- boundary-versus-interior signal localization;
-- anisotropy and angular boundary coverage;
-- dense-small-cell protection.
-
-The workflow distinguishes:
-
-- one dominant bright source;
-- several strong sources;
-- many weak neighbors;
-- dense homogeneous neighborhoods with no clear source.
-
-This reusable evidence is calculated once and reused by all correction scenarios.
-
-## Correction scenarios
-
-The workflow supports a configurable scenario engine. At minimum, the required anchors are `none`, `conservative`, `medium`, and `strong`.
-
-Default scenarios:
-
-| Scenario | Purpose |
-|---|---|
-| `none` | Preserve the original value when spillover evidence is weak |
-| `conservative` | Protect dense small-cell regions and limit removed signal |
-| `medium` | Standard correction for moderate directional evidence |
-| `strong` | Aggressive correction for compelling, high-confidence spillover |
-| `dominant_neighbor` | Use only the strongest plausible source |
-| `top_neighbors` | Use only the strongest configured number of sources |
-| `high_specificity` | Correct only when evidence exceeds a stringent threshold |
-
-Scenario behavior is controlled by:
-
-```json
-"scenario_shrinkage": {
-  "none": 0.0,
-  "conservative": 0.30,
-  "medium": 0.60,
-  "strong": 0.90,
-  "dominant_neighbor": 0.70,
-  "top_neighbors": 0.65,
-  "high_specificity": 0.75
-}
-```
-
-and by maximum removable fractions:
-
-```json
-"scenario_max_fraction_removed": {
-  "none": 0.0,
-  "conservative": 0.25,
-  "medium": 0.50,
-  "strong": 0.80,
-  "dominant_neighbor": 0.55,
-  "top_neighbors": 0.60,
-  "high_specificity": 0.65
-}
-```
-
-These are sensitivity scenarios, not claims that one universal correction strength is correct for every cell.
-
-## Suggested corrected value
-
-For each cell-protein pair, the workflow selects one applicable scenario or returns `unresolved`.
-
-The recommendation considers:
-
-- evidence that spillover exists;
-- source-attribution confidence;
-- segmentation confidence;
-- boundary localization;
-- neighbor-to-focal contrast;
-- dense-small-cell protection;
-- proposed fraction removed;
-- disagreement between scenarios;
-- recommendation margin between the best and second-best scenarios.
-
-The output includes:
-
-- suggested scenario;
-- suggested signed corrected intensity;
-- suggested nonnegative corrected intensity;
-- estimated contamination removed;
-- second-best scenario;
-- selection margin;
-- recommendation confidence;
-- overcorrection risk;
-- structured reason codes;
-- readable reason text.
-
-The suggested value remains auditable because all alternative scenarios are retained.
-
-## Confidence fields
-
-Confidence is intentionally decomposed.
-
-| Field | Meaning |
-|---|---|
-| segmentation confidence | Reliability of the focal cell mask and derived geometry |
-| localization confidence | Strength of boundary-versus-interior evidence |
-| source-attribution confidence | Ability to assign spillover to one or more neighbors |
-| bleeding confidence | Evidence that meaningful spillover is present |
-| recommendation confidence | Confidence in selecting one correction scenario |
-| overcorrection risk | Risk that subtraction removes genuine focal-cell signal |
-
-These values do not represent biological protein-positivity confidence. Biological gating belongs in the downstream gating and phenotyping workflow.
-
-## Neighbor-contribution output
-
-Per-neighbor output may become large.
-
-```json
-{
-  "save_neighbor_contributions": "top",
-  "max_saved_neighbors_per_cell_protein": 5
-}
-```
-
-Modes:
-
-| Value | Behavior |
-|---|---|
-| `none` | Save aggregate exposure only |
-| `top` | Save the strongest contributors per cell-protein pair |
-| `all` | Save every eligible neighbor contribution |
-
-Use `all` cautiously on large datasets.
-
-## Checkpoints and restarting
-
-The workflow contains fourteen ordered stages:
-
-```text
 01_roi_selection
 02_cropped_arrays
 03_corrected_image
@@ -558,170 +56,987 @@ The workflow contains fourteen ordered stages:
 12_roi_h5ad
 13_qc_plots
 14_summary
-```
 
-Resume is enabled by default. Each checkpoint includes a configuration signature and upstream signature.
+Conceptually, the pipeline is:
 
-Changing correction parameters invalidates only the correction and downstream stages. It does not force image cropping or pixel-feature extraction to rerun.
+SpatialData image + segmentation + table
+                |
+                v
+native-grid registration and ROI crop
+                |
+                v
+XOA/generic intensity preprocessing + QC masks
+                |
+                v
+original per-cell protein measurements
+                |
+                v
+direct cell-cell contact graph
+                |
+                v
+pair-specific interface geometry
+                |
+                v
+marker-localization-specific focal reference
+                |
+                v
+source plausibility + directionality tests
+                |
+                v
+physically supported interface contamination
+                |
+                +-----------------------------+
+                |                             |
+                v                             v
+all correction scenarios              pair-level audit evidence
+                |
+                v
+preservation-first recommendation
+                |
+                v
+ROI AnnData + tables + QC outputs
 
-Disable resume:
+The input Zarr remains read-only.
 
-```bash
---no-resume
-```
+Core assumptions
 
-Force one stage and every downstream stage:
+The workflow assumes:
 
-```bash
---force-stage 10_correction_scenarios
-```
+the table has one row per segmented biological cell;
 
-Large array checkpoints:
+a positive integer table column directly identifies the same cell in the label raster;
 
-```bash
---save-array-checkpoints
---memory-map-arrays
---cleanup-arrays
-```
+the protein image and label raster share the same full-resolution native y-by-x grid;
 
-## Main outputs
+table spatial coordinates can be related to native image pixels using one scale, optional x/y reflection, and optional global origins;
 
-For ROI `<ROI>`, outputs are written beneath:
+original image-derived measurements must remain available for auditing;
 
-```text
+correction should not require trusted cell-type labels;
+
+large segmentation failures cannot be fully repaired by intensity subtraction.
+
+The CLI does not infer a label crosswalk from centroid matching or polygon overlap. The configured table label column is authoritative and is checked against the cropped raster.
+
+Files used with this workflow
+
+protein_spillover_cli.py
+protein_spillover_config.json
+protein_spillover_README.md
+submit_protein_spillover_all_rois.sh
+run_protein_spillover_all_rois_sbatch_direct.slurm
+review_spillover_phenotype_ambiguity.py   optional downstream review step
+
+Installation
+
+Use Python 3.10 or newer in an isolated environment containing the project's SpatialData stack.
+
+python -m pip install -e .
+
+Verify:
+
+protein-spillover --help
+protein-spillover run --help
+
+First inspect a new project
+
+protein-spillover inspect \
+  --zarr /data/project/spatial_data.zarr
+
+A more detailed inspection:
+
+protein-spillover inspect \
+  --zarr /data/project/spatial_data.zarr \
+  --table cell_table \
+  --image morphology_focus \
+  --labels cell_labels \
+  --roi-col roi
+
+Use the output to verify table/image/label names, spatial coordinates, authoritative raster labels, ROI labels, and protein-channel names.
+
+Configuration
+
+Generate a template with:
+
+protein-spillover template-config \
+  --output protein_spillover_config.json
+
+Run with:
+
+protein-spillover run \
+  --config protein_spillover_config.json
+
+CLI values override JSON values.
+
+Analysis channels versus correction channels
+
+These are now deliberately separate concepts.
+
+analysis_channels
+
+All selected channels are measured, retained, exported, and available to reports.
+
+For example, a panel can include lineage, state, functional, tumor, and structural proteins:
+
+"analysis_channels": [
+  "CD3E",
+  "CD4",
+  "CD8A",
+  "PD-1",
+  "LAG-3",
+  "CD45RA",
+  "CD45RO",
+  "CD16",
+  "GranzymeB",
+  "CD20",
+  "CD138",
+  "HLA-DR",
+  "CD11c",
+  "CD68",
+  "CD163",
+  "PD-L1",
+  "CD45",
+  "Ki-67",
+  "CD31",
+  "PTEN",
+  "PanCK",
+  "E-Cadherin"
+]
+
+correction_channels
+
+Only these markers are spillover-corrected. All other analyzed proteins are written through every correction scenario unchanged.
+
+The current immune-lineage-focused set is:
+
+"correction_channels": [
+  "CD45",
+  "CD3E",
+  "CD4",
+  "CD8A",
+  "CD20",
+  "CD138",
+  "CD16",
+  "CD11c",
+  "CD68",
+  "CD163",
+  "HLA-DR"
+]
+
+This intentionally leaves markers such as PD-1, LAG-3, CD45RA, CD45RO, GranzymeB, Ki-67, PD-L1, PanCK, E-Cadherin, CD31, and PTEN uncorrected unless they are explicitly added later.
+
+Repeated CLI flags can override the list:
+
+--correction-channel CD45 \
+--correction-channel CD3E \
+--correction-channel CD8A
+
+Marker localization
+
+Every correction marker requires a localization class.
+
+Current project mapping:
+
+"marker_localization": {
+  "CD45": "membrane",
+  "CD3E": "membrane",
+  "CD4": "membrane",
+  "CD8A": "membrane",
+  "CD20": "membrane",
+  "CD138": "membrane",
+  "CD16": "membrane",
+  "CD11c": "membrane",
+  "CD68": "intracellular",
+  "CD163": "membrane",
+  "HLA-DR": "membrane"
+}
+
+Accepted classes are:
+
+membrane
+
+intracellular
+
+nuclear
+
+The current pipeline has whole-cell segmentation but no true nuclear mask. A selected nuclear correction marker is therefore preserved with reference_quality = nuclear_reference_unavailable rather than being corrected using an eroded cell center as a fake nucleus.
+
+CLI override syntax:
+
+--marker-localization CD8A=membrane \
+--marker-localization CD68=intracellular
+
+Intensity preprocessing
+
+xenium_xoa
+
+Use this for Xenium Onboard Analysis protein images.
+
+XOA images are already deconvolved, autofluorescence-background-subtracted, saturation-masked, and spectrally corrected. XOA normally stores these values with a positive offset of 100.
+
+The workflow:
+
+subtracts the configured XOA storage offset;
+
+retains signed offset-adjusted values for intensity summaries;
+
+creates a clipped nonnegative signal representation for thresholds and interface evidence;
+
+does not perform another Gaussian background subtraction.
+
+"input_intensity_mode": "xenium_xoa",
+"xenium_xoa_intensity_offset": 100.0
+
+apply_gaussian_background_subtraction is a legacy compatibility key and is not needed in a new Xenium XOA configuration.
+
+precorrected
+
+Uses supplied values directly as signed analysis intensities.
+
+generic_gaussian
+
+Performs broad Gaussian background subtraction for generic multiplex images that have not already been background corrected.
+
+QC masks
+
+A channel-matched QC mask may be supplied.
+
+For Xenium XOA saturation masks, valid pixels are normally 0 and masked pixels are 255.
+
+"protein_qc_mask_name": "morphology_focus_qc_masks",
+"qc_mask_valid_value": 0,
+"xenium_require_qc_mask": false
+
+When no QC mask is supplied in XOA mode and xenium_zero_is_invalid_without_qc_mask is true, exact stored zeros are excluded as a conservative fallback. The official QC mask remains preferable when available.
+
+Existing per-cell feature extraction
+
+Stages 01-08 continue to calculate the original audit/QC features, including:
+
+whole-cell intensity;
+
+eroded interior intensity;
+
+internal boundary intensity;
+
+outer-ring intensity;
+
+outer noncell signal;
+
+outer other-cell signal;
+
+positive-pixel fractions;
+
+angular boundary coverage;
+
+boundary anisotropy;
+
+direct contact counts;
+
+shared-boundary geometry;
+
+dense-small-cell geometry scores.
+
+These measurements remain useful for QC and downstream reporting.
+
+The dense-small-cell geometry score no longer changes the correction amount or recommendation. It is a diagnostic only.
+
+Pairwise interface geometry
+
+The correction model begins from the segmentation itself.
+
+For every touching pair A-B, the workflow constructs directed focal-cell interface bands:
+
+A-facing-B pixels
+B-facing-A pixels
+
+The inward interface-band width is controlled by:
+
+"interface_band_pixels": 2
+
+or:
+
+--interface-band 2
+
+Each focal-cell interface pixel is assigned to one neighboring label only. This prevents one suspicious pixel from being counted multiple times when a cell contacts several neighbors.
+
+The interface geometry is built once per ROI and reused across correction markers.
+
+Source plausibility
+
+For a directed pair source -> focal, the source must be genuinely marker-positive at its side of the shared interface.
+
+A source is considered plausible only when it has enough valid interface pixels and either:
+
+a sufficient positive-pixel fraction at that interface; or
+
+a source-interface mean at or above the channel threshold.
+
+The main settings are:
+
+"minimum_interface_valid_pixels": 2,
+"interface_source_positive_fraction": 0.25
+
+The source intensity is a gate. It does not directly determine the subtraction magnitude.
+
+Focal-cell intrinsic reference
+
+Membrane markers
+
+For membrane markers, the focal reference is the valid focal boundary that is not assigned to a plausible marker-positive source.
+
+This makes broad membrane expression protective.
+
+Example:
+
+CD8 at source-facing interface: high
+CD8 on the rest of focal membrane: also high
+=> little interface excess
+=> little or no correction
+
+Conversely:
+
+CD8 at source-facing interface: high
+CD8 on the rest of focal membrane: near background
+=> localized interface excess
+=> contamination can be supported
+
+Intracellular markers
+
+For intracellular markers such as CD68, the self-reference comes from the eroded internal cell region.
+
+Distributed internal signal therefore protects the cell, while a thin source-facing rim with little internal signal can be corrected.
+
+Reference sufficiency
+
+The package explicitly checks whether enough independent focal-cell reference remains.
+
+Important settings:
+
+"minimum_reference_valid_pixels": 4,
+"minimum_reference_valid_fraction": 0.5,
+"minimum_unconfounded_reference_fraction": 0.15,
+"good_reference_fraction": 0.5
+
+For membrane markers, minimum_unconfounded_reference_fraction is the important minimum: the focal cell needs enough valid membrane that is not occupied by plausible marker-positive source interfaces.
+
+For intracellular markers, minimum_reference_valid_fraction governs the internal reference.
+
+Reference quality is reported as values such as:
+
+good
+
+limited
+
+insufficient
+
+not_needed_no_plausible_source
+
+marker_not_selected_for_correction
+
+nuclear_reference_unavailable
+
+Interface noise and evidence thresholds
+
+The package estimates a robust marker-specific image noise scale and expresses interface evidence in units of that scale.
+
+Default settings:
+
+"interface_noise_threshold_floor_fraction": 0.05,
+"interface_min_excess_noise_sd": 1.0,
+"interface_strong_min_excess_noise_sd": 0.5,
+"interface_high_specificity_min_excess_noise_sd": 2.0,
+"interface_source_directionality_noise_sd": 1.0,
+"interface_high_specificity_source_over_focal_noise_sd": 1.0
+
+The standard interface model requires:
+
+a plausible source;
+
+a sufficient focal reference;
+
+enough valid focal interface pixels;
+
+focal interface excess above the standard noise threshold;
+
+source signal above the focal reference by the configured directionality threshold.
+
+The strong sensitivity method uses a more permissive interface-evidence threshold. The high_specificity method uses stricter interface evidence and also requires the source side to exceed the focal interface.
+
+Physically supported contamination amount
+
+For a supported directed pair, the core contamination amount is:
+
+focal interface excess
+x
+valid focal interface pixel count / valid focal whole-cell pixel count
+
+Therefore the amount removed comes from signal actually observed inside the focal segmentation.
+
+A very bright neighboring cell cannot create an arbitrarily large subtraction if the focal interface contains only a small amount of excess signal.
+
+Marker-attribution ambiguity
+
+The CLI now has an explicit marker-level ambiguity output:
+
+intrinsic_vs_neighbor_signal_ambiguous
+
+It means:
+
+The focal cell contains marker signal and plausible marker-positive neighbors occupy enough of the relevant reference region that the image cannot reliably distinguish intrinsic focal expression from neighbor-derived signal.
+
+It does not mean that the cell is definitely double positive.
+
+Important supporting fields include:
+
+free_reference_fraction
+
+source_contact_fraction
+
+source_supported_signal_fraction
+
+intrinsic_signal_support
+
+n_plausible_source_neighbors
+
+n_supported_interfaces
+
+n_high_specificity_interfaces
+
+reference_quality
+
+ambiguity_reason
+
+Default ambiguity settings:
+
+"ambiguity_source_contact_fraction": 0.6,
+"ambiguity_min_marker_positive_fraction": 0.05
+
+Example: a CD8 T cell surrounded by CD4-positive cells can have unambiguous CD8 because its neighbors are not plausible CD8 sources, while CD4 on the same focal cell may be flagged ambiguous if CD4-positive neighbors occupy most of the usable membrane reference.
+
+Ambiguous markers are preserved by the automatic recommendation.
+
+Annotation policy
+
+Correction is always annotation-free.
+
+Supported modes are:
+
+Mode
+
+Behavior
+
+disabled
+
+Cell-type labels do not participate in correction
+
+reporting_only
+
+Labels may be carried into outputs for reporting
+
+validation_only
+
+Labels may be retained for downstream validation
+
+weak_prior is no longer supported and will raise an error.
+
+Even when celltype_col is configured, it does not alter pairwise interface correction or scenario recommendation.
+
+Correction scenarios
+
+All configured methods are calculated and saved. They are sensitivity views of the same pairwise-interface evidence, not seven independent biological models.
+
+Scenario
+
+Current meaning
+
+none
+
+No subtraction
+
+conservative
+
+Partial standard interface correction
+
+medium
+
+Full standard interface-supported correction
+
+strong
+
+Full correction using the more permissive supported-interface set
+
+dominant_neighbor
+
+Full standard correction from the largest supported source only
+
+top_neighbors
+
+Full standard correction from the top configured supported sources
+
+high_specificity
+
+Full correction using only high-specificity interfaces
+
+Recommended scenario scaling:
+
+"scenario_shrinkage": {
+  "none": 0.0,
+  "conservative": 0.5,
+  "medium": 1.0,
+  "strong": 1.0,
+  "dominant_neighbor": 1.0,
+  "top_neighbors": 1.0,
+  "high_specificity": 1.0
+}
+
+The interface calculation is already physically bounded. Scenario maximum fractions therefore act only as emergency guardrails:
+
+"scenario_max_fraction_removed": {
+  "none": 0.0,
+  "conservative": 1.0,
+  "medium": 1.0,
+  "strong": 1.0,
+  "dominant_neighbor": 1.0,
+  "top_neighbors": 1.0,
+  "high_specificity": 1.0
+}
+
+Do not retain the old 0.25/0.50/0.80-style caps unless you deliberately want those arbitrary caps to override the new physically supported correction.
+
+Automatic recommendation
+
+The automatic recommendation is intentionally limited to:
+
+none
+conservative
+medium
+
+The other methods remain fully saved for manual selection and sensitivity analysis.
+
+The decision rule is preservation-first:
+
+marker not selected for correction
+        -> none
+
+intrinsic-vs-neighbor attribution ambiguous
+        -> none + ambiguity flag
+
+no supported contaminating interface
+        -> none
+
+supported contamination + substantial intrinsic focal signal
+or limited but usable reference
+        -> conservative
+
+clear supported interface contamination + adequate reference
++ little intrinsic support
+        -> medium
+
+The marker-level threshold controlling whether intrinsic focal signal pushes the recommendation toward conservative is:
+
+"recommendation_intrinsic_support_threshold": 0.25
+
+strong, dominant_neighbor, top_neighbors, and high_specificity cannot automatically win recommendation through heuristic score bonuses.
+
+All correction methods are retained
+
+The authoritative long scenario table contains every configured scenario for every cell-protein pair:
+
+correction_scenarios_<ROI>.parquet
+
+This is intentional. A downstream QMD can compare:
+
+Raw / none
+Conservative
+Medium
+Strong
+Dominant neighbor
+Top neighbors
+High specificity
+Recommended
+
+The recommended result does not replace or delete any alternative correction method.
+
+Non-correction markers also remain present. Their corrected values are equal to their original values and they are labeled as not selected for correction.
+
+Pair-level audit output
+
+neighbor_contributions_<ROI>.parquet now represents directed pairwise interface evidence rather than whole-cell neighbor heuristics.
+
+Depending on save_neighbor_contributions, it can contain fields such as:
+
+focal label;
+
+neighbor label;
+
+protein;
+
+focal interface intensity;
+
+source interface intensity;
+
+focal reference intensity;
+
+valid interface pixels;
+
+interface excess;
+
+source plausibility;
+
+standard/strong/high-specificity support flags;
+
+physically supported contamination;
+
+pair evidence strength;
+
+source rank.
+
+Configure storage with:
+
+"save_neighbor_contributions": "top",
+"max_saved_neighbors_per_cell_protein": 5
+
+Use all only when full pair-level auditing is worth the larger output.
+
+Geometry and density diagnostics
+
+The workflow still calculates:
+
+segmentation area;
+
+number of touching neighbors;
+
+total and maximum shared-boundary edge counts;
+
+shared-boundary fraction proxy;
+
+small-cell rank;
+
+neighbor-density rank;
+
+shared-boundary-density rank;
+
+dense_small_cell_score.
+
+These remain useful for QC. They no longer directly increase or decrease the correction amount.
+
+Legacy keys such as dense_protection_strength are retained by the CLI only for compatibility with older configuration files and should not be treated as active correction controls.
+
+Legacy correction keys
+
+The current CLI still accepts several old keys so existing JSON files do not immediately fail, but they no longer control the pairwise-interface correction model:
+
+annotation_prior_strength
+minimum_neighbor_focal_contrast
+strong_neighbor_focal_contrast
+high_specificity_minimum_evidence
+minimum_source_attribution_confidence
+recommendation_minimum_margin
+recommendation_minimum_confidence
+allow_weighted_recommendation
+dense_protection_strength
+overcorrection_fraction_warning
+retain_signed_corrected_values
+
+A new project configuration should omit them unless compatibility with an older external wrapper requires them.
+
+Signed and nonnegative corrected values are both written by the current implementation regardless of the legacy retain_signed_corrected_values switch.
+
+Checkpoints and algorithm versioning
+
+The correction algorithm version is included in checkpoint signatures beginning at stage 09.
+
+Therefore, replacing an old installed CLI with the current pairwise-interface CLI automatically invalidates:
+
+09_neighbor_exposure
+10_correction_scenarios
+11_recommendations
+12_roi_h5ad
+13_qc_plots
+14_summary
+
+while allowing valid stages 01-08 to be reused.
+
+You normally do not need to set force_recompute_stages merely because the correction algorithm was updated.
+
+Force a stage manually only when needed:
+
+--force-stage 09_neighbor_exposure
+
+For changes to registration, cropping, channel selection, or authoritative label mapping, force the appropriate earlier stage instead.
+
+Main outputs
+
+For ROI <ROI>, outputs are written under:
+
 <outdir>/<ROI>/
-```
 
 Important outputs include:
 
-| Output | Description |
-|---|---|
-| `spillover_features_<ROI>.parquet` | Original per-cell protein and spatial features joined to metadata |
-| `cell_contact_pairs_<ROI>.parquet` | Direct contact graph with shared-boundary evidence |
-| `geometry_density_<ROI>.parquet` | Cell geometry, contact density, and dense-small-cell scores |
-| `neighbor_exposure_<ROI>.parquet` | Cell-protein spillover evidence and source attribution |
-| `neighbor_contributions_<ROI>.parquet` | Optional retained source-neighbor contributions |
-| `correction_scenarios_<ROI>.parquet` | All scenario-level corrected values and contamination estimates |
-| `suggested_corrections_<ROI>.parquet` | Recommended scenarios, confidence, risks, and reasons |
-| `correction_features_wide_<ROI>.parquet` | Per-cell wide correction columns for AnnData integration |
-| `channel_thresholds_<ROI>.csv` | Exploratory image thresholds by marker |
-| `cell_id_to_raster_label_<ROI>.parquet` | Table-label validation and centroid diagnostics |
-| `raster_mapping_summary_<ROI>.json` | Mapping coverage and validation summary |
-| `roi_with_spillover_features_<ROI>.h5ad` | ROI AnnData with original features and correction outputs in `.obs` |
-| `spillover_summary_<ROI>.json` | Final run summary |
-| `RUN_COMPLETE.json` | Successful completion marker |
-| `qc_plots/` | Intensity and feature QC |
-| `correction_qc/` | Correction magnitude, density, and recommendation QC |
-| `checkpoints/` | Stage markers and cached artifacts |
+Output
 
-If Parquet support is unavailable, tables fall back to compressed CSV files ending in `.csv.gz`.
+Description
 
-## Feature naming
+spillover_features_<ROI>.parquet
 
-Original image-derived features use names such as:
+Original per-cell protein/spatial features joined to metadata
 
-```text
-protein_<channel>_raw_whole_mean
-protein_<channel>_whole_mean
-protein_<channel>_inner_mean
-protein_<channel>_boundary_mean
-protein_<channel>_outer_othercell_mean
-protein_<channel>_boundary_to_inner_log2
-protein_<channel>_boundary_angular_coverage
-protein_<channel>_boundary_anisotropy
-```
+cell_contact_pairs_<ROI>.parquet
 
-Correction features written to AnnData include scenario-specific and suggested outputs using safe marker and scenario names.
+Direct contact graph
 
-Do not discard the original columns after correction.
+geometry_density_features_<ROI>.parquet
 
-## QC interpretation
+Geometry and density diagnostics
 
-A well-behaved correction should generally show:
+neighbor_exposure_<ROI>.parquet
 
-- limited correction when no brighter neighbor is present;
-- stronger correction when one bright neighbor dominates and boundary evidence is directional;
-- reduced aggressiveness in dense small-cell regions;
-- no severe downward trend in corrected lineage-marker intensity with local density;
-- preservation of isolated high-intensity cells;
-- a manageable unresolved fraction;
-- few extreme negative signed corrected values.
+Cell-marker pairwise-interface exposure summary and ambiguity fields
 
-Warnings include:
+neighbor_contributions_<ROI>.parquet
 
-- corrected intensity decreasing sharply as local density increases;
-- strong corrections driven by many weak neighbors;
-- large fractions removed without a dominant source;
-- widespread strong correction in dense immune aggregates;
-- scenario disagreement across a large fraction of cells;
-- low source-attribution confidence with high recommended correction.
+Optional directed source-interface audit records
 
-## Common troubleshooting
+correction_scenarios_<ROI>.parquet
 
-### Table labels are absent from the crop
+Every saved correction scenario
 
-Check pixel size, orientation, origins, ROI coordinates, table-label column, crop margin, and whether the selected image and labels belong to the same acquisition.
+suggested_corrections_<ROI>.parquet
 
-Do not lower `minimum_raster_mapping_fraction` merely to bypass registration problems.
+Preservation-first recommendation and ambiguity metadata
 
-### Dense lymphocytes appear overcorrected
+correction_features_wide_<ROI>.parquet
 
-Review:
+Wide per-cell correction fields for AnnData
 
-- dense-small-cell score;
-- neighbor count;
-- shared-boundary fraction;
-- dominant-source fraction;
-- correction scenario selected;
-- fraction removed;
-- correction versus density QC plots.
+channel_thresholds_<ROI>.csv
 
-Consider increasing `dense_protection_strength`, lowering conservative shrinkage, or reducing the conservative maximum removable fraction. Re-run from `08_geometry_density` or `10_correction_scenarios`, depending on which settings changed.
+Image-level marker thresholds
 
-### Strong correction is selected too often
+cell_id_to_raster_label_<ROI>.parquet
 
-Increase `strong_neighbor_focal_contrast`, increase `recommendation_minimum_confidence`, or increase `recommendation_minimum_margin`.
+Table-label validation diagnostics
 
-### Too many unresolved results
+raster_mapping_summary_<ROI>.json
 
-Inspect whether scenario scores are genuinely close. Lowering the minimum margin may reduce unresolved calls but can create false precision.
+Mapping validation summary
 
-### Neighbor-contribution tables are too large
+roi_with_spillover_features_<ROI>.h5ad
 
-Use `save_neighbor_contributions: top` or `none` and reduce `max_saved_neighbors_per_cell_protein`.
+ROI AnnData with original and correction outputs in .obs
 
-### Corrected values are negative
+spillover_summary_<ROI>.json
 
-Signed corrected values are retained intentionally. Use the separate nonnegative corrected output when a downstream method requires nonnegative values. Do not silently overwrite signed values.
+Final run summary
 
-### Memory pressure
+RUN_COMPLETE.json
 
-Analyze one ROI at a time, reduce channels, retain memory mapping, use top-neighbor output, or increase QC downsampling. Scenario evaluation itself should be relatively inexpensive because it reuses cached exposure evidence.
+Completion marker
 
-## Recommended workflow for a new project
+qc_plots/
 
-1. Run `inspect` and record exact element, table, column, and channel names.
-2. Verify the authoritative table label against the raster.
-3. Confirm image-label native-grid equality.
-4. Verify pixel size, orientation, and origins on several cells.
-5. Start with one representative ROI and a small channel set.
-6. Review raster-mapping and intensity QC.
-7. Review whole-cell, interior, boundary, and outer-other-cell features.
-8. Review geometry-density and neighbor-exposure outputs.
-9. Compare all correction scenarios before trusting the suggested value.
-10. Specifically examine dense lymphocyte-rich regions for overcorrection.
-11. Only then expand to all channels and ROIs.
-12. Pass original, alternative, and suggested corrected values to the downstream gating and phenotyping CLI.
+Image and feature QC
 
-## Full option reference
+correction_qc/
 
-```bash
+Correction/recommendation QC
+
+checkpoints/
+
+Stage markers and cached artifacts
+
+If Parquet support is unavailable, tables fall back to .csv.gz.
+
+Wide AnnData correction fields
+
+Scenario-specific columns are retained for all methods, for example:
+
+protein_CD8A_none_corrected_nonnegative
+protein_CD8A_conservative_corrected_nonnegative
+protein_CD8A_medium_corrected_nonnegative
+protein_CD8A_strong_corrected_nonnegative
+protein_CD8A_dominant_neighbor_corrected_nonnegative
+protein_CD8A_top_neighbors_corrected_nonnegative
+protein_CD8A_high_specificity_corrected_nonnegative
+
+The wide output also includes marker-level recommendation/ambiguity information such as:
+
+protein_CD8A_suggested_corrected_nonnegative
+protein_CD8A_suggested_fraction_removed
+protein_CD8A_recommendation_confidence
+protein_CD8A_n_plausible_source_neighbors
+protein_CD8A_n_supported_interfaces
+protein_CD8A_free_reference_fraction
+protein_CD8A_source_contact_fraction
+protein_CD8A_source_supported_signal_fraction
+protein_CD8A_intrinsic_signal_support
+protein_CD8A_intrinsic_vs_neighbor_signal_ambiguous
+
+Do not discard original protein columns after correction.
+
+QC interpretation
+
+A well-behaved result should generally show:
+
+no correction when there is no plausible marker-positive contacting source;
+
+little correction when a membrane marker is broadly present around the focal cell;
+
+stronger correction when excess signal is restricted to a source-facing interface;
+
+correction bounded by the amount of focal-cell signal physically attributable to the interface;
+
+preservation of cells lacking enough independent reference to resolve intrinsic versus neighbor-derived signal;
+
+no systematic loss of true lineage markers merely because same-lineage cells cluster together;
+
+all correction alternatives retained for comparison.
+
+Important warnings include:
+
+many cells with reference_quality = insufficient;
+
+unexpectedly high intrinsic_vs_neighbor_signal_ambiguous rates;
+
+large fractions removed from cells with strong intrinsic-signal support;
+
+large corrections supported by very few valid interface pixels;
+
+lineage-marker populations collapsing only under one aggressive sensitivity method;
+
+systematic differences tied to ROI registration or QC-mask failure.
+
+Troubleshooting
+
+True lineage-positive cells are still overcorrected
+
+Inspect:
+
+free_reference_fraction;
+
+intrinsic_signal_support;
+
+focal interface means;
+
+focal reference means;
+
+n_supported_interfaces;
+
+pair-level supported_contamination;
+
+reference_quality;
+
+the marker localization class.
+
+Do not tune dense_protection_strength; it no longer controls correction.
+
+Obvious contamination is undercorrected
+
+Inspect:
+
+source-interface positivity;
+
+marker threshold;
+
+robust noise scale;
+
+interface excess;
+
+source-over-reference directionality;
+
+minimum_interface_valid_pixels;
+
+interface_min_excess_noise_sd.
+
+Too many ambiguity flags
+
+Inspect whether cells genuinely lack unconfounded membrane/internal reference.
+
+Potential settings are:
+
+minimum_reference_valid_pixels
+minimum_unconfounded_reference_fraction
+minimum_reference_valid_fraction
+ambiguity_source_contact_fraction
+ambiguity_min_marker_positive_fraction
+
+Do not lower these solely to eliminate flags. The ambiguity output exists specifically to represent cases the image cannot identify reliably.
+
+Strong looks too aggressive
+
+strong is a sensitivity output and is not eligible for automatic recommendation. Compare its pair-level support against medium rather than changing the recommendation system.
+
+Neighbor-contribution tables are too large
+
+Use:
+
+"save_neighbor_contributions": "top",
+"max_saved_neighbors_per_cell_protein": 5
+
+or set save_neighbor_contributions to none.
+
+Corrected signed values are negative
+
+The signed output preserves the signed XOA measurement minus the estimated contamination. Use the separate nonnegative corrected field for downstream methods requiring nonnegative values.
+
+Memory pressure
+
+The new stage 09 performs pixel-level interface measurements, so it is more expensive than the old whole-cell exposure calculation. The implementation reuses memory-mapped image checkpoints and one ROI-level interface assignment rather than creating one image-sized mask per pair.
+
+Practical controls remain:
+
+analyze one ROI per job;
+
+retain memory mapping;
+
+use save_neighbor_contributions: top or none;
+
+reduce unnecessary analysis_channels only if image-processing time becomes limiting;
+
+increase Slurm memory/time only if real ROI profiling shows the current request is insufficient.
+
+Downstream phenotype ambiguity review
+
+The spillover CLI deliberately does not decide whether an ambiguous marker means a true double-positive or mixed-lineage cell.
+
+After the CLI finishes, review_spillover_phenotype_ambiguity.py can be run as a separate post-processing step. It can compare phenotype assignments across all saved correction methods and prioritize cells whose correction uncertainty changes their biological interpretation.
+
+This avoids manually reviewing every same-lineage cell in a crowded region. For example, a germinal-center B cell whose CD20 is neighbor-confounded but remains B-like under every correction method can be excluded from review, whereas a T cell switching between CD8-only and CD4/CD8-double-positive can be prioritized.
+
+Recommended project workflow
+
+Verify registration and authoritative table-to-raster mapping.
+
+Run one representative ROI.
+
+Confirm XOA preprocessing and QC-mask behavior.
+
+Inspect original cell-level protein features.
+
+Inspect pairwise interface evidence for CD3E, CD4, CD8A, CD20, CD68, and other key lineage markers.
+
+Confirm same-marker neighboring cells are preserved.
+
+Confirm clear cross-lineage interface contamination is corrected.
+
+Inspect ambiguity flags in densely packed immune regions.
+
+Compare all seven correction methods in the QMD; do not hide sensitivity outputs behind recommended.
+
+Confirm the recommended result uses only none, conservative, or medium.
+
+Expand to all ROIs.
+
+Run the downstream phenotype-ambiguity reviewer on completed outputs.
+
+Perform targeted manual review only for biologically consequential ambiguous cells.
+
+Full option reference
+
 protein-spillover run --help
-```
 
-Generate the exact configuration schema:
+Generate the exact current configuration template with:
 
-```bash
 protein-spillover template-config \
   --output full_protein_spillover_config.json
-```

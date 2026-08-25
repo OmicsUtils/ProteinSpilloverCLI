@@ -131,7 +131,8 @@ from skimage.measure import regionprops
 from skimage.morphology import dilation, erosion, disk
 from skimage.segmentation import find_boundaries
 
-SCRIPT_FIX_VERSION = "2026-08-12-protein-spillover-v2-low-memory-readonly-fix"
+SCRIPT_FIX_VERSION = "2026-08-25-protein-spillover-v3-immune-interface-correction"
+CORRECTION_ALGORITHM_VERSION = "2026-08-25-immune-pairwise-interface-v1"
 
 # Required for writing pandas nullable string columns to h5ad with newer AnnData.
 ad.settings.allow_write_nullable_strings = True
@@ -200,9 +201,38 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # -------------------------------------------------------------------------
     # Protein channels
     # -------------------------------------------------------------------------
-    # None means all channels except exclude_channels.
+    # None means all channels except exclude_channels. All selected channels are
+    # still measured and reported. Spillover correction itself is restricted to
+    # correction_channels so state/functional proteins are not altered merely
+    # because they are present in the image.
     "analysis_channels": None,
     "exclude_channels": ["DAPI"],
+    "correction_channels": [
+        "CD45",
+        "CD3E",
+        "CD4",
+        "CD8A",
+        "CD20",
+        "CD138",
+        "CD16",
+        "CD11c",
+        "CD68",
+        "CD163",
+        "HLA-DR",
+    ],
+    "marker_localization": {
+        "CD45": "membrane",
+        "CD3E": "membrane",
+        "CD4": "membrane",
+        "CD8A": "membrane",
+        "CD20": "membrane",
+        "CD138": "membrane",
+        "CD16": "membrane",
+        "CD11c": "membrane",
+        "CD68": "intracellular",
+        "CD163": "membrane",
+        "HLA-DR": "membrane",
+    },
 
     # -------------------------------------------------------------------------
     # Intensity preprocessing
@@ -253,10 +283,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # -------------------------------------------------------------------------
     # Multi-scenario protein-spillover correction
     # -------------------------------------------------------------------------
-    # Correction is annotation-free by default. Cell-type metadata can be copied
-    # or used as a weak, explicitly enabled prior, but is never required.
-    "annotation_mode": "disabled",  # disabled, reporting_only, validation_only, weak_prior
-    "annotation_prior_strength": 0.10,
+    # Correction is always annotation-free. Cell-type metadata may be copied or
+    # retained for downstream reporting/validation, but it never changes the
+    # correction amount or automatic recommendation.
+    "annotation_mode": "disabled",  # disabled, reporting_only, validation_only
+    "annotation_prior_strength": 0.10,  # deprecated; retained for old configs
 
     # Required correction anchors. Additional scenarios are also produced.
     "correction_scenarios": [
@@ -268,25 +299,54 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "top_neighbors",
         "high_specificity",
     ],
+    # Scenario scaling now applies to a physically bounded pairwise-interface
+    # contamination estimate. Conservative intentionally removes only half of the
+    # standard supported amount; medium removes the full standard amount. The
+    # remaining scenarios are retained as fully saved sensitivity analyses.
     "scenario_shrinkage": {
         "none": 0.0,
-        "conservative": 0.30,
-        "medium": 0.60,
-        "strong": 0.90,
-        "dominant_neighbor": 0.70,
-        "top_neighbors": 0.65,
-        "high_specificity": 0.75,
+        "conservative": 0.50,
+        "medium": 1.00,
+        "strong": 1.00,
+        "dominant_neighbor": 1.00,
+        "top_neighbors": 1.00,
+        "high_specificity": 1.00,
     },
+    # The pairwise interface estimate is already physically bounded by unique
+    # focal-cell pixels. Non-none scenarios therefore default to a 100% emergency
+    # ceiling rather than arbitrary 25/50/80% limits that could control the result.
     "scenario_max_fraction_removed": {
         "none": 0.0,
-        "conservative": 0.25,
-        "medium": 0.50,
-        "strong": 0.80,
-        "dominant_neighbor": 0.55,
-        "top_neighbors": 0.60,
-        "high_specificity": 0.65,
+        "conservative": 1.00,
+        "medium": 1.00,
+        "strong": 1.00,
+        "dominant_neighbor": 1.00,
+        "top_neighbors": 1.00,
+        "high_specificity": 1.00,
     },
     "top_neighbors_n": 3,
+
+    # Pairwise interface correction. The same segmentation geometry is reused
+    # across markers, while marker localization controls the focal self-reference.
+    "interface_band_pixels": 2,
+    "minimum_interface_valid_pixels": 2,
+    "minimum_reference_valid_pixels": 4,
+    "minimum_reference_valid_fraction": 0.50,
+    "minimum_unconfounded_reference_fraction": 0.15,
+    "good_reference_fraction": 0.50,
+    "interface_source_positive_fraction": 0.25,
+    "interface_noise_threshold_floor_fraction": 0.05,
+    "interface_min_excess_noise_sd": 1.00,
+    "interface_strong_min_excess_noise_sd": 0.50,
+    "interface_high_specificity_min_excess_noise_sd": 2.00,
+    "interface_source_directionality_noise_sd": 1.00,
+    "interface_high_specificity_source_over_focal_noise_sd": 1.00,
+    "ambiguity_source_contact_fraction": 0.60,
+    "ambiguity_min_marker_positive_fraction": 0.05,
+    "recommendation_intrinsic_support_threshold": 0.25,
+
+    # Deprecated whole-cell correction parameters retained so older JSON configs
+    # still parse. They no longer control pairwise interface subtraction.
     "minimum_neighbor_focal_contrast": 1.20,
     "strong_neighbor_focal_contrast": 3.00,
     "high_specificity_minimum_evidence": 0.75,
@@ -484,6 +544,7 @@ def finalize_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
     list_keys = (
         "analysis_channels",
+        "correction_channels",
         "exclude_channels",
         "cell_shape_candidates",
         "metadata_columns",
@@ -499,6 +560,32 @@ def finalize_config(config: Mapping[str, Any]) -> dict[str, Any]:
             output[key] = [item.strip() for item in value.split(",") if item.strip()]
         else:
             output[key] = _deduplicate_preserve_order([str(item) for item in value])
+
+    output["marker_localization"] = {
+        str(key): str(value).strip().lower()
+        for key, value in dict(output.get("marker_localization", {})).items()
+    }
+    valid_localizations = {"membrane", "intracellular", "nuclear"}
+    missing_localization = [
+        marker
+        for marker in output["correction_channels"]
+        if marker not in output["marker_localization"]
+    ]
+    if missing_localization:
+        raise ValueError(
+            "Every correction channel requires marker_localization. Missing: "
+            f"{missing_localization}"
+        )
+    invalid_localization = {
+        marker: output["marker_localization"][marker]
+        for marker in output["correction_channels"]
+        if output["marker_localization"][marker] not in valid_localizations
+    }
+    if invalid_localization:
+        raise ValueError(
+            "marker_localization values must be membrane, intracellular, or nuclear. "
+            f"Invalid entries: {invalid_localization}"
+        )
 
     output["manual_channel_thresholds"] = {
         str(key): float(value)
@@ -541,17 +628,18 @@ def finalize_config(config: Mapping[str, Any]) -> dict[str, Any]:
         [*mandatory_metadata, *output["metadata_columns"]]
     )
 
-    valid_annotation_modes = {"disabled", "reporting_only", "validation_only", "weak_prior"}
+    valid_annotation_modes = {"disabled", "reporting_only", "validation_only"}
     annotation_mode = str(output["annotation_mode"])
+    if annotation_mode == "weak_prior":
+        raise ValueError(
+            "annotation_mode='weak_prior' is no longer supported. Pairwise interface "
+            "correction is intentionally annotation-free; use validation_only if you "
+            "want cell-type metadata retained for downstream checks."
+        )
     if annotation_mode not in valid_annotation_modes:
         raise ValueError(
             f"annotation_mode must be one of {sorted(valid_annotation_modes)}; "
             f"received {annotation_mode!r}."
-        )
-    if annotation_mode == "weak_prior" and output.get("celltype_col") is None:
-        raise ValueError(
-            "annotation_mode='weak_prior' requires celltype_col. Cell types remain "
-            "optional; use annotation_mode='disabled' to run without them."
         )
     output["annotation_mode"] = annotation_mode
 
@@ -598,6 +686,42 @@ def finalize_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if not np.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError(f"{key} must be finite and in [0, 1].")
         output[key] = value
+
+    fraction_keys = (
+        "minimum_reference_valid_fraction",
+        "minimum_unconfounded_reference_fraction",
+        "good_reference_fraction",
+        "interface_source_positive_fraction",
+        "interface_noise_threshold_floor_fraction",
+        "ambiguity_source_contact_fraction",
+        "ambiguity_min_marker_positive_fraction",
+        "recommendation_intrinsic_support_threshold",
+    )
+    for key in fraction_keys:
+        value = float(output[key])
+        if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{key} must be finite and in [0, 1].")
+        output[key] = value
+
+    nonnegative_keys = (
+        "interface_min_excess_noise_sd",
+        "interface_strong_min_excess_noise_sd",
+        "interface_high_specificity_min_excess_noise_sd",
+        "interface_source_directionality_noise_sd",
+        "interface_high_specificity_source_over_focal_noise_sd",
+    )
+    for key in nonnegative_keys:
+        value = float(output[key])
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"{key} must be finite and nonnegative.")
+        output[key] = value
+
+    if int(output["interface_band_pixels"]) < 1:
+        raise ValueError("interface_band_pixels must be at least 1.")
+    if int(output["minimum_interface_valid_pixels"]) < 1:
+        raise ValueError("minimum_interface_valid_pixels must be at least 1.")
+    if int(output["minimum_reference_valid_pixels"]) < 1:
+        raise ValueError("minimum_reference_valid_pixels must be at least 1.")
 
     if int(output["top_neighbors_n"]) < 1:
         raise ValueError("top_neighbors_n must be at least 1.")
@@ -944,22 +1068,28 @@ CHECKPOINT_STAGE_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
         "dense_shared_boundary_quantile",
     ),
     "09_neighbor_exposure": (
-        "minimum_neighbor_focal_contrast", "strong_neighbor_focal_contrast",
+        "correction_channels", "marker_localization", "interface_band_pixels",
+        "minimum_interface_valid_pixels", "minimum_reference_valid_pixels",
+        "minimum_reference_valid_fraction",
+        "minimum_unconfounded_reference_fraction", "good_reference_fraction",
+        "interface_source_positive_fraction",
+        "interface_noise_threshold_floor_fraction",
+        "interface_min_excess_noise_sd",
+        "interface_strong_min_excess_noise_sd",
+        "interface_high_specificity_min_excess_noise_sd",
+        "interface_source_directionality_noise_sd",
+        "interface_high_specificity_source_over_focal_noise_sd",
+        "ambiguity_source_contact_fraction",
+        "ambiguity_min_marker_positive_fraction",
         "top_neighbors_n", "save_neighbor_contributions",
         "max_saved_neighbors_per_cell_protein",
     ),
     "10_correction_scenarios": (
         "correction_scenarios", "scenario_shrinkage",
-        "scenario_max_fraction_removed", "dense_protection_strength",
-        "high_specificity_minimum_evidence",
-        "retain_signed_corrected_values",
+        "scenario_max_fraction_removed", "retain_signed_corrected_values",
     ),
     "11_recommendations": (
-        "annotation_mode", "annotation_prior_strength",
-        "minimum_source_attribution_confidence",
-        "recommendation_minimum_margin",
-        "recommendation_minimum_confidence",
-        "allow_weighted_recommendation",
+        "annotation_mode", "recommendation_intrinsic_support_threshold",
         "overcorrection_fraction_warning",
     ),
     "12_roi_h5ad": ("save_roi_h5ad",),
@@ -1094,8 +1224,14 @@ def build_stage_signature(
     upstream_signature: Optional[str] = None,
 ) -> str:
     """Build a stage signature from cumulative settings and runtime context."""
+    stage_index = CHECKPOINT_STAGE_ORDER.index(stage)
     payload = {
         "stage": stage,
+        "algorithm_version": (
+            CORRECTION_ALGORITHM_VERSION
+            if stage_index >= CHECKPOINT_STAGE_ORDER.index("09_neighbor_exposure")
+            else None
+        ),
         "config": cumulative_stage_config(config, stage),
         "input_source": input_path_signature(config["sdata_zarr_path"]),
         "runtime_context": dict(runtime_context or {}),
@@ -3621,177 +3757,1037 @@ def build_directed_contact_table(contact_df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([a_to_b, b_to_a], ignore_index=True)
 
 
+def _neighbor_slices(
+    shape: tuple[int, int],
+    dy: int,
+    dx: int,
+) -> tuple[tuple[slice, slice], tuple[slice, slice]]:
+    """Return aligned target/source slices for one 8-neighbor offset."""
+    height, width = shape
+    target_y0 = max(0, -dy)
+    target_y1 = min(height, height - dy)
+    target_x0 = max(0, -dx)
+    target_x1 = min(width, width - dx)
+    source_y0 = target_y0 + dy
+    source_y1 = target_y1 + dy
+    source_x0 = target_x0 + dx
+    source_x1 = target_x1 + dx
+    return (
+        (slice(target_y0, target_y1), slice(target_x0, target_x1)),
+        (slice(source_y0, source_y1), slice(source_x0, source_x1)),
+    )
+
+
+def build_pairwise_interface_geometry(
+    segmentation_yx: np.ndarray,
+    interface_band_pixels: int,
+    logger: Optional[logging.Logger] = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Build one non-overlapping neighbor assignment for each focal boundary pixel.
+
+    ``interface_neighbor_yx[y, x]`` stores the label of the directly contacting
+    neighboring cell assigned to that focal-cell pixel. Contact seeds are found
+    from the 8-neighbor label raster and then propagated inward only through
+    pixels belonging to the same focal cell. A pixel can therefore be assigned
+    to at most one neighboring cell, preventing the same protein signal from
+    being charged to several sources in crowded regions.
+
+    ``boundary_band_yx`` is an inward cell-boundary band of the same configured
+    width and is used to establish membrane-marker self-reference signal.
+    """
+    segmentation = np.asarray(segmentation_yx)
+    if segmentation.ndim != 2:
+        raise ValueError("segmentation_yx must be two-dimensional.")
+
+    band_pixels = int(interface_band_pixels)
+    if band_pixels < 1:
+        raise ValueError("interface_band_pixels must be at least 1.")
+
+    assignment_dtype = (
+        np.int32
+        if int(np.max(segmentation, initial=0)) <= np.iinfo(np.int32).max
+        else np.int64
+    )
+    interface_neighbor = np.zeros(segmentation.shape, dtype=assignment_dtype)
+    offsets = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    ]
+
+    # Seed focal pixels that directly touch another nonzero cell label. If a
+    # corner pixel touches more than one label, assign it deterministically to
+    # the smaller neighboring label. The exact tie choice affects only a tiny
+    # corner region, while the one-neighbor-per-pixel invariant is preserved.
+    for dy, dx in offsets:
+        target_slice, source_slice = _neighbor_slices(segmentation.shape, dy, dx)
+        focal = segmentation[target_slice]
+        neighbor = segmentation[source_slice]
+        target_assignment = interface_neighbor[target_slice]
+        valid = (focal > 0) & (neighbor > 0) & (neighbor != focal)
+        replace = valid & (
+            (target_assignment == 0)
+            | (neighbor.astype(assignment_dtype, copy=False) < target_assignment)
+        )
+        target_assignment[replace] = neighbor[replace].astype(
+            assignment_dtype,
+            copy=False,
+        )
+
+    # Grow the direct-contact seeds inward by the requested number of pixels,
+    # never crossing a segmentation label boundary.
+    for _ in range(1, band_pixels):
+        previous = interface_neighbor.copy()
+        candidate = np.zeros_like(interface_neighbor)
+        for dy, dx in offsets:
+            target_slice, source_slice = _neighbor_slices(segmentation.shape, dy, dx)
+            focal = segmentation[target_slice]
+            source_focal = segmentation[source_slice]
+            source_assignment = previous[source_slice]
+            target_candidate = candidate[target_slice]
+            valid = (
+                (focal > 0)
+                & (source_focal == focal)
+                & (source_assignment > 0)
+            )
+            replace = valid & (
+                (target_candidate == 0)
+                | (source_assignment < target_candidate)
+            )
+            target_candidate[replace] = source_assignment[replace]
+        fill = (interface_neighbor == 0) & (candidate > 0)
+        interface_neighbor[fill] = candidate[fill]
+        del previous, candidate
+
+    # Build an inward boundary band independent of whether that boundary faces
+    # another cell or extracellular space. This provides the membrane-marker
+    # self-reference region.
+    boundary_band = find_boundaries(
+        segmentation,
+        connectivity=2,
+        mode="inner",
+    ) & (segmentation > 0)
+    for _ in range(1, band_pixels):
+        previous_boundary = boundary_band.copy()
+        grown = boundary_band.copy()
+        for dy, dx in offsets:
+            target_slice, source_slice = _neighbor_slices(segmentation.shape, dy, dx)
+            focal = segmentation[target_slice]
+            source_focal = segmentation[source_slice]
+            source_boundary = previous_boundary[source_slice]
+            grown[target_slice] |= (
+                (focal > 0)
+                & (source_focal == focal)
+                & source_boundary
+            )
+        boundary_band = grown
+        del previous_boundary, grown
+
+    diagnostics = {
+        "interface_band_pixels": band_pixels,
+        "n_interface_pixels": int((interface_neighbor > 0).sum()),
+        "n_boundary_band_pixels": int(boundary_band.sum()),
+        "n_cells_with_interface_pixels": int(
+            np.unique(segmentation[interface_neighbor > 0]).size
+        ),
+    }
+    if logger is not None:
+        logger.info(
+            "Built pairwise interface geometry: %s assigned interface pixels, "
+            "%s total boundary-band pixels, band width=%s.",
+            diagnostics["n_interface_pixels"],
+            diagnostics["n_boundary_band_pixels"],
+            band_pixels,
+        )
+    return interface_neighbor, boundary_band, diagnostics
+
+
+def estimate_interface_noise_scales(
+    analysis_cyx: np.ndarray,
+    valid_pixel_cyx: np.ndarray,
+    segmentation_yx: np.ndarray,
+    channel_names: Sequence[str],
+    threshold_df: pd.DataFrame,
+    config: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Estimate a robust absolute noise scale for interface directionality tests.
+
+    The primary estimate is 1.4826 times the median absolute deviation of valid
+    signed analysis pixels outside segmented cells. A small fraction of the
+    channel's existing positive-pixel threshold is used only as a floor so a
+    degenerate zero-MAD background cannot make arbitrarily tiny differences look
+    meaningful.
+    """
+    analysis = np.asarray(analysis_cyx)
+    valid = np.asarray(valid_pixel_cyx, dtype=bool)
+    if analysis.shape != valid.shape:
+        raise ValueError("analysis_cyx and valid_pixel_cyx must have identical shapes.")
+
+    threshold_lookup = threshold_df.set_index("channel")["threshold"].to_dict()
+    background = segmentation_yx == 0
+    epsilon = float(config["epsilon"])
+    floor_fraction = float(config["interface_noise_threshold_floor_fraction"])
+    records: list[dict[str, Any]] = []
+
+    for channel_index, channel in enumerate(channel_names):
+        eligible = (
+            background
+            & valid[channel_index]
+            & np.isfinite(analysis[channel_index])
+        )
+        values = analysis[channel_index][eligible].astype(float, copy=False)
+        threshold = float(threshold_lookup[channel])
+        floor = max(epsilon, abs(threshold) * floor_fraction)
+
+        if values.size >= 10:
+            median = float(np.median(values))
+            mad = float(np.median(np.abs(values - median)))
+            robust_sigma = 1.4826 * mad
+            if not np.isfinite(robust_sigma):
+                robust_sigma = 0.0
+        else:
+            median = np.nan
+            mad = np.nan
+            robust_sigma = 0.0
+
+        noise_scale = max(float(robust_sigma), floor)
+        records.append(
+            {
+                "channel": channel,
+                "background_median_signed": median,
+                "background_mad_signed": mad,
+                "robust_noise_scale": noise_scale,
+                "threshold_floor": floor,
+                "n_valid_background_pixels": int(values.size),
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def _aggregate_pair_interface_statistics(
+    signal_yx: np.ndarray,
+    valid_yx: np.ndarray,
+    threshold: float,
+    interface_positions: np.ndarray,
+    interface_pair_inverse: np.ndarray,
+    n_pairs: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return valid counts, mean signal, and positive fractions for each pair."""
+    signal_flat = np.asarray(signal_yx).reshape(-1)
+    valid_flat = np.asarray(valid_yx, dtype=bool).reshape(-1)
+    values = signal_flat[interface_positions]
+    valid = valid_flat[interface_positions] & np.isfinite(values)
+
+    counts = np.bincount(
+        interface_pair_inverse[valid],
+        minlength=n_pairs,
+    ).astype(np.int64)
+    sums = np.bincount(
+        interface_pair_inverse[valid],
+        weights=values[valid],
+        minlength=n_pairs,
+    ).astype(float)
+    positive_counts = np.bincount(
+        interface_pair_inverse[valid],
+        weights=(values[valid] > float(threshold)).astype(float),
+        minlength=n_pairs,
+    ).astype(float)
+
+    means = np.divide(
+        sums,
+        counts,
+        out=np.full(n_pairs, np.nan, dtype=float),
+        where=counts > 0,
+    )
+    positive_fraction = np.divide(
+        positive_counts,
+        counts,
+        out=np.zeros(n_pairs, dtype=float),
+        where=counts > 0,
+    )
+    return counts, means, positive_fraction
+
+
 def calculate_neighbor_exposure(
     feature_df: pd.DataFrame,
     contact_df: pd.DataFrame,
     geometry_df: pd.DataFrame,
+    analysis_cyx: np.ndarray,
+    signal_cyx: np.ndarray,
+    valid_pixel_cyx: np.ndarray,
+    segmentation_yx: np.ndarray,
+    threshold_df: pd.DataFrame,
     channel_names: Sequence[str],
     config: Mapping[str, Any],
+    logger: Optional[logging.Logger] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Estimate reusable marker-specific neighbor-source evidence.
+    """Estimate annotation-free, pairwise interface-supported contamination.
 
-    The expensive image and geometry calculations have already occurred. This
-    stage converts the contact graph into a compact cell-protein evidence table
-    that every correction scenario reuses. Neighbor signal contributes only to
-    the extent that it exceeds the focal signal, is geometrically exposed, and
-    has directional boundary support.
+    Unlike the previous whole-cell neighbor model, this implementation asks two
+    separate questions for each directed cell pair and marker:
+
+    1. Is the neighboring cell a plausible physical source of this marker at the
+       shared interface?
+    2. How much *excess signal actually observed inside the focal cell* is
+       localized to that interface relative to an independent focal-cell
+       reference region?
+
+    Neighbor intensity can pass or fail source/directionality gates but never
+    determines the amount subtracted. The subtraction amount is bounded by the
+    focal interface excess multiplied by the fraction of the focal cell occupied
+    by that interface. Interface pixels are assigned to one source only.
     """
     label_col = str(config["cell_label_col"])
-    directed = build_directed_contact_table(contact_df)
-    if directed.empty:
-        empty = []
-        for channel in channel_names:
-            safe = make_safe_name(channel)
-            prefix = f"protein_{safe}"
-            temp = feature_df[[label_col, f"{prefix}_whole_nonnegative_mean"]].copy()
-            temp["protein"] = channel
-            temp = temp.rename(columns={f"{prefix}_whole_nonnegative_mean": "original_nonnegative_intensity"})
-            for col in (
-                "all_neighbor_basis", "dominant_neighbor_basis", "top_neighbor_basis",
-                "strongest_neighbor_intensity", "weighted_neighbor_intensity",
-                "dominant_source_fraction", "source_attribution_confidence",
-                "neighbor_contrast", "boundary_support", "homogeneous_neighbor_score",
-            ):
-                temp[col] = 0.0
-            temp["dominant_neighbor_label"] = np.nan
-            empty.append(temp)
-        return pd.concat(empty, ignore_index=True), pd.DataFrame()
+    channels = [str(channel) for channel in channel_names]
+    correction_channels = set(str(x) for x in config["correction_channels"])
+    localization_map = {
+        str(key): str(value)
+        for key, value in dict(config["marker_localization"]).items()
+    }
+    thresholds = threshold_df.set_index("channel")["threshold"].to_dict()
+
+    interface_neighbor_yx, boundary_band_yx, interface_diagnostics = (
+        build_pairwise_interface_geometry(
+            segmentation_yx=segmentation_yx,
+            interface_band_pixels=int(config["interface_band_pixels"]),
+            logger=logger,
+        )
+    )
+    noise_df = estimate_interface_noise_scales(
+        analysis_cyx=analysis_cyx,
+        valid_pixel_cyx=valid_pixel_cyx,
+        segmentation_yx=segmentation_yx,
+        channel_names=channels,
+        threshold_df=threshold_df,
+        config=config,
+    )
+    noise_lookup = noise_df.set_index("channel")["robust_noise_scale"].to_dict()
+
+    segmentation_flat = np.asarray(segmentation_yx).reshape(-1)
+    interface_neighbor_flat = interface_neighbor_yx.reshape(-1)
+    interface_positions = np.flatnonzero(
+        (segmentation_flat > 0) & (interface_neighbor_flat > 0)
+    )
+
+    maximum_label = int(np.max(segmentation_yx, initial=0))
+    pair_key_base = maximum_label + 1
+    if interface_positions.size > 0:
+        interface_focal = segmentation_flat[interface_positions].astype(np.int64, copy=False)
+        interface_neighbor = interface_neighbor_flat[interface_positions].astype(np.int64, copy=False)
+        pixel_pair_keys = interface_focal * pair_key_base + interface_neighbor
+        unique_pair_keys, pair_inverse = np.unique(pixel_pair_keys, return_inverse=True)
+        pair_inverse = pair_inverse.astype(np.int32, copy=False)
+        pair_focal = (unique_pair_keys // pair_key_base).astype(np.int64, copy=False)
+        pair_neighbor = (unique_pair_keys % pair_key_base).astype(np.int64, copy=False)
+        reciprocal_keys = pair_neighbor * pair_key_base + pair_focal
+        reciprocal_index = np.searchsorted(unique_pair_keys, reciprocal_keys)
+        reciprocal_valid = reciprocal_index < unique_pair_keys.size
+        safe_reciprocal_index = np.minimum(
+            reciprocal_index,
+            max(0, unique_pair_keys.size - 1),
+        )
+        reciprocal_valid &= (
+            unique_pair_keys[safe_reciprocal_index] == reciprocal_keys
+        )
+        reciprocal_index = np.where(reciprocal_valid, reciprocal_index, -1).astype(np.int64)
+    else:
+        unique_pair_keys = np.empty(0, dtype=np.int64)
+        pair_inverse = np.empty(0, dtype=np.int32)
+        pair_focal = np.empty(0, dtype=np.int64)
+        pair_neighbor = np.empty(0, dtype=np.int64)
+        reciprocal_index = np.empty(0, dtype=np.int64)
+
+    n_pairs = int(unique_pair_keys.size)
+    pair_shared_edges = np.zeros(n_pairs, dtype=np.int64)
+    if n_pairs > 0 and not contact_df.empty:
+        edge_lookup = {
+            (int(min(row.cell_label_a, row.cell_label_b)), int(max(row.cell_label_a, row.cell_label_b))):
+                int(row.shared_boundary_pixel_edges)
+            for row in contact_df.itertuples(index=False)
+        }
+        pair_shared_edges = np.asarray(
+            [
+                edge_lookup.get(
+                    (int(min(focal, neighbor)), int(max(focal, neighbor))),
+                    0,
+                )
+                for focal, neighbor in zip(pair_focal, pair_neighbor)
+            ],
+            dtype=np.int64,
+        )
+
+    labels = pd.to_numeric(feature_df[label_col], errors="raise").astype(np.int64).to_numpy()
+    if labels.size == 0:
+        return pd.DataFrame(), pd.DataFrame()
+    label_lookup_size = max(maximum_label, int(labels.max(initial=0))) + 1
+    feature_row_by_label = np.full(label_lookup_size, -1, dtype=np.int64)
+    feature_row_by_label[labels] = np.arange(labels.size, dtype=np.int64)
 
     geometry_lookup = geometry_df.set_index(label_col)
-    directed["focal_shared_fraction"] = directed.apply(
-        lambda row: float(row["shared_boundary_pixel_edges"])
-        / max(1.0, float(geometry_lookup.loc[row["focal_label"], "boundary_area_pixels"])),
-        axis=1,
-    )
+    threshold_lookup = {str(key): float(value) for key, value in thresholds.items()}
+    min_interface_pixels = int(config["minimum_interface_valid_pixels"])
+    min_reference_pixels = int(config["minimum_reference_valid_pixels"])
+    min_reference_valid_fraction = float(config["minimum_reference_valid_fraction"])
+    min_unconfounded_fraction = float(config["minimum_unconfounded_reference_fraction"])
+    source_positive_fraction_min = float(config["interface_source_positive_fraction"])
+    standard_excess_sd = float(config["interface_min_excess_noise_sd"])
+    strong_excess_sd = float(config["interface_strong_min_excess_noise_sd"])
+    high_excess_sd = float(config["interface_high_specificity_min_excess_noise_sd"])
+    source_directionality_sd = float(config["interface_source_directionality_noise_sd"])
+    high_source_over_focal_sd = float(config["interface_high_specificity_source_over_focal_noise_sd"])
+    ambiguity_contact_fraction = float(config["ambiguity_source_contact_fraction"])
+    ambiguity_positive_fraction = float(config["ambiguity_min_marker_positive_fraction"])
+    top_n = int(config["top_neighbors_n"])
 
     evidence_records: list[pd.DataFrame] = []
     contribution_records: list[pd.DataFrame] = []
-    top_n = int(config["top_neighbors_n"])
-    min_contrast = float(config["minimum_neighbor_focal_contrast"])
+    boundary_flat = boundary_band_yx.reshape(-1)
 
-    for channel in channel_names:
+    for channel_index, channel in enumerate(channels):
         safe = make_safe_name(channel)
         prefix = f"protein_{safe}"
-        intensity_col = f"{prefix}_whole_nonnegative_mean"
-        boundary_col = f"{prefix}_boundary_nonnegative_mean"
-        inner_col = f"{prefix}_inner_nonnegative_mean"
-        anisotropy_col = f"{prefix}_boundary_anisotropy"
+        eligible_for_correction = channel in correction_channels
+        localization = localization_map.get(channel, "not_selected")
+        threshold = float(threshold_lookup[channel])
+        noise_scale = max(float(noise_lookup[channel]), float(config["epsilon"]))
 
-        marker = feature_df[[label_col, intensity_col, boundary_col, inner_col, anisotropy_col]].copy()
-        marker = marker.rename(
-            columns={
-                label_col: "label",
-                intensity_col: "intensity",
-                boundary_col: "boundary_intensity",
-                inner_col: "inner_intensity",
-                anisotropy_col: "boundary_anisotropy",
-            }
-        )
-        focal = marker.add_prefix("focal_")
-        neighbor = marker.add_prefix("neighbor_")
-        edges = directed.merge(focal, left_on="focal_label", right_on="focal_label", how="left")
-        edges = edges.merge(neighbor, left_on="neighbor_label", right_on="neighbor_label", how="left")
+        original = feature_df[[label_col]].copy()
+        original["protein"] = channel
+        original["correction_eligible"] = bool(eligible_for_correction)
+        original["localization_class"] = localization
+        original["original_signed_intensity"] = pd.to_numeric(
+            feature_df[f"{prefix}_whole_mean"],
+            errors="coerce",
+        ).fillna(0.0)
+        original["original_nonnegative_intensity"] = pd.to_numeric(
+            feature_df[f"{prefix}_whole_nonnegative_mean"],
+            errors="coerce",
+        ).fillna(0.0).clip(lower=0.0)
+        original["marker_threshold"] = threshold
+        original["interface_noise_scale"] = noise_scale
 
-        focal_intensity = edges["focal_intensity"].clip(lower=0).fillna(0.0)
-        neighbor_intensity = edges["neighbor_intensity"].clip(lower=0).fillna(0.0)
-        contrast = (neighbor_intensity + 1e-6) / (focal_intensity + 1e-6)
-        positive_excess = (neighbor_intensity - focal_intensity).clip(lower=0)
-        contrast_support = ((contrast - min_contrast) / max(min_contrast, 1e-6)).clip(0, 1)
-        boundary_support = (
-            (edges["focal_boundary_intensity"].clip(lower=0).fillna(0.0) + 1e-6)
-            / (edges["focal_inner_intensity"].clip(lower=0).fillna(0.0) + 1e-6)
-        )
-        boundary_support = ((np.log2(boundary_support).clip(lower=0)) / 3.0).clip(0, 1)
-        anisotropy = edges["focal_boundary_anisotropy"].clip(0, 1).fillna(0.0)
-        localization_support = np.maximum(boundary_support, anisotropy)
-        geometry_support = edges["focal_shared_fraction"].clip(0, 1)
+        # Non-selected markers are still written through every correction
+        # scenario unchanged so reports can retain all measured proteins without
+        # pretending that correction was applied.
+        if not eligible_for_correction:
+            for column in (
+                "all_neighbor_basis",
+                "strong_neighbor_basis",
+                "high_specificity_basis",
+                "dominant_neighbor_basis",
+                "top_neighbor_basis",
+                "strongest_neighbor_intensity",
+                "weighted_neighbor_intensity",
+                "dominant_source_fraction",
+                "source_attribution_confidence",
+                "neighbor_contrast",
+                "boundary_support",
+                "homogeneous_neighbor_score",
+                "free_reference_fraction",
+                "source_contact_fraction",
+                "source_supported_signal_fraction",
+                "intrinsic_signal_support",
+                "maximum_interface_excess",
+                "maximum_pair_evidence_strength",
+            ):
+                original[column] = 0.0
+            for column in (
+                "n_plausible_source_neighbors",
+                "n_supported_interfaces",
+                "n_strong_supported_interfaces",
+                "n_high_specificity_interfaces",
+            ):
+                original[column] = 0
+            original["dominant_neighbor_label"] = np.nan
+            original["reference_quality"] = "marker_not_selected_for_correction"
+            original["intrinsic_vs_neighbor_signal_ambiguous"] = False
+            original["ambiguity_reason"] = "marker_not_selected_for_correction"
+            original = original.merge(
+                geometry_df[[label_col, "dense_small_cell_score", "dense_small_cell_flag"]],
+                on=label_col,
+                how="left",
+                validate="one_to_one",
+            )
+            evidence_records.append(original)
+            continue
 
-        edges["protein"] = channel
-        edges["neighbor_contrast"] = contrast
-        edges["boundary_support"] = localization_support
-        edges["raw_contribution"] = (
-            positive_excess * geometry_support * (0.25 + 0.75 * localization_support) * contrast_support
-        )
-        edges["raw_contribution"] = edges["raw_contribution"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        if localization not in {"membrane", "intracellular", "nuclear"}:
+            raise ValueError(
+                f"Unsupported localization class {localization!r} for correction "
+                f"marker {channel!r}."
+            )
+        if localization == "nuclear":
+            # A nuclear marker must have an actual nuclear reference; the current
+            # segmentation contains whole cells only. Preserve rather than using
+            # an eroded-cell center as a potentially misleading pseudo-nucleus.
+            for column in (
+                "all_neighbor_basis",
+                "strong_neighbor_basis",
+                "high_specificity_basis",
+                "dominant_neighbor_basis",
+                "top_neighbor_basis",
+                "strongest_neighbor_intensity",
+                "weighted_neighbor_intensity",
+                "dominant_source_fraction",
+                "source_attribution_confidence",
+                "neighbor_contrast",
+                "boundary_support",
+                "homogeneous_neighbor_score",
+                "free_reference_fraction",
+                "source_contact_fraction",
+                "source_supported_signal_fraction",
+                "intrinsic_signal_support",
+                "maximum_interface_excess",
+                "maximum_pair_evidence_strength",
+            ):
+                original[column] = 0.0
+            for column in (
+                "n_plausible_source_neighbors",
+                "n_supported_interfaces",
+                "n_strong_supported_interfaces",
+                "n_high_specificity_interfaces",
+            ):
+                original[column] = 0
+            original["correction_eligible"] = False
+            original["dominant_neighbor_label"] = np.nan
+            original["reference_quality"] = "nuclear_reference_unavailable"
+            original["intrinsic_vs_neighbor_signal_ambiguous"] = False
+            original["ambiguity_reason"] = "nuclear_reference_unavailable_preserve"
+            original = original.merge(
+                geometry_df[[label_col, "dense_small_cell_score", "dense_small_cell_flag"]],
+                on=label_col,
+                how="left",
+                validate="one_to_one",
+            )
+            evidence_records.append(original)
+            continue
 
-        edges = edges.sort_values(
-            ["focal_label", "raw_contribution"], ascending=[True, False]
+        if n_pairs == 0:
+            pair_counts = np.empty(0, dtype=np.int64)
+            pair_means = np.empty(0, dtype=float)
+            pair_positive_fraction = np.empty(0, dtype=float)
+        else:
+            pair_counts, pair_means, pair_positive_fraction = (
+                _aggregate_pair_interface_statistics(
+                    signal_yx=signal_cyx[channel_index],
+                    valid_yx=valid_pixel_cyx[channel_index],
+                    threshold=threshold,
+                    interface_positions=interface_positions,
+                    interface_pair_inverse=pair_inverse,
+                    n_pairs=n_pairs,
+                )
+            )
+
+        source_interface_mean = np.full(n_pairs, np.nan, dtype=float)
+        source_interface_positive_fraction = np.zeros(n_pairs, dtype=float)
+        source_interface_valid_pixels = np.zeros(n_pairs, dtype=np.int64)
+        reciprocal_exists = reciprocal_index >= 0
+        if reciprocal_exists.any():
+            reciprocal_rows = reciprocal_index[reciprocal_exists]
+            source_interface_mean[reciprocal_exists] = pair_means[reciprocal_rows]
+            source_interface_positive_fraction[reciprocal_exists] = (
+                pair_positive_fraction[reciprocal_rows]
+            )
+            source_interface_valid_pixels[reciprocal_exists] = pair_counts[reciprocal_rows]
+
+        source_plausible = (
+            reciprocal_exists
+            & (source_interface_valid_pixels >= min_interface_pixels)
+            & (
+                (source_interface_positive_fraction >= source_positive_fraction_min)
+                | (source_interface_mean >= threshold)
+            )
         )
-        edges["source_rank"] = edges.groupby("focal_label").cumcount() + 1
-        edges["top_neighbor_contribution"] = np.where(
-            edges["source_rank"] <= top_n, edges["raw_contribution"], 0.0
+
+        signal_flat = np.asarray(signal_cyx[channel_index]).reshape(-1)
+        valid_flat = np.asarray(valid_pixel_cyx[channel_index], dtype=bool).reshape(-1)
+        boundary_valid = (
+            boundary_flat
+            & (segmentation_flat > 0)
+            & valid_flat
+            & np.isfinite(signal_flat)
         )
-        grouped = edges.groupby("focal_label", as_index=False).agg(
-            all_neighbor_basis=("raw_contribution", "sum"),
-            dominant_neighbor_basis=("raw_contribution", "max"),
-            top_neighbor_basis=("top_neighbor_contribution", "sum"),
-            strongest_neighbor_intensity=("neighbor_intensity", "max"),
-            weighted_neighbor_intensity=("neighbor_intensity", "mean"),
-            neighbor_contrast=("neighbor_contrast", "max"),
-            boundary_support=("boundary_support", "max"),
+        boundary_labels = segmentation_flat[boundary_valid].astype(np.int64, copy=False)
+        boundary_values = signal_flat[boundary_valid]
+        boundary_counts_by_label = np.bincount(
+            boundary_labels,
+            minlength=label_lookup_size,
+        ).astype(np.int64)
+        boundary_sums_by_label = np.bincount(
+            boundary_labels,
+            weights=boundary_values,
+            minlength=label_lookup_size,
+        ).astype(float)
+        boundary_positive_by_label = np.bincount(
+            boundary_labels,
+            weights=(boundary_values > threshold).astype(float),
+            minlength=label_lookup_size,
+        ).astype(float)
+        boundary_positive_fraction_by_label = np.divide(
+            boundary_positive_by_label,
+            boundary_counts_by_label,
+            out=np.zeros(label_lookup_size, dtype=float),
+            where=boundary_counts_by_label > 0,
         )
-        dominant_rows = edges.drop_duplicates("focal_label", keep="first")[[
-            "focal_label", "neighbor_label", "raw_contribution"
-        ]].rename(
-            columns={
-                "neighbor_label": "dominant_neighbor_label",
-                "raw_contribution": "dominant_neighbor_basis_check",
-            }
+
+        plausible_contact_flat = np.zeros(segmentation_flat.size, dtype=bool)
+        if interface_positions.size > 0 and source_plausible.any():
+            plausible_pixel = source_plausible[pair_inverse]
+            plausible_contact_flat[interface_positions[plausible_pixel]] = True
+
+        plausible_contact_valid = (
+            plausible_contact_flat
+            & boundary_flat
+            & valid_flat
+            & np.isfinite(signal_flat)
         )
-        grouped = grouped.merge(dominant_rows, on="focal_label", how="left")
-        grouped["dominant_source_fraction"] = np.divide(
-            grouped["dominant_neighbor_basis"],
-            grouped["all_neighbor_basis"],
-            out=np.zeros(grouped.shape[0], dtype=float),
-            where=grouped["all_neighbor_basis"].to_numpy() > 0,
+        plausible_labels = segmentation_flat[plausible_contact_valid].astype(np.int64, copy=False)
+        plausible_values = signal_flat[plausible_contact_valid]
+        plausible_counts_by_label = np.bincount(
+            plausible_labels,
+            minlength=label_lookup_size,
+        ).astype(np.int64)
+        plausible_sums_by_label = np.bincount(
+            plausible_labels,
+            weights=plausible_values,
+            minlength=label_lookup_size,
+        ).astype(float)
+
+        if localization == "membrane":
+            reference_valid = boundary_valid & ~plausible_contact_flat
+            reference_labels = segmentation_flat[reference_valid].astype(np.int64, copy=False)
+            reference_values = signal_flat[reference_valid]
+            reference_counts_by_label = np.bincount(
+                reference_labels,
+                minlength=label_lookup_size,
+            ).astype(np.int64)
+            reference_sums_by_label = np.bincount(
+                reference_labels,
+                weights=reference_values,
+                minlength=label_lookup_size,
+            ).astype(float)
+            reference_positive_by_label = np.bincount(
+                reference_labels,
+                weights=(reference_values > threshold).astype(float),
+                minlength=label_lookup_size,
+            ).astype(float)
+            reference_mean_by_label = np.divide(
+                reference_sums_by_label,
+                reference_counts_by_label,
+                out=np.zeros(label_lookup_size, dtype=float),
+                where=reference_counts_by_label > 0,
+            )
+            reference_positive_fraction_by_label = np.divide(
+                reference_positive_by_label,
+                reference_counts_by_label,
+                out=np.zeros(label_lookup_size, dtype=float),
+                where=reference_counts_by_label > 0,
+            )
+            free_reference_fraction_by_label = np.divide(
+                reference_counts_by_label,
+                boundary_counts_by_label,
+                out=np.zeros(label_lookup_size, dtype=float),
+                where=boundary_counts_by_label > 0,
+            )
+            reference_valid_fraction_by_label = np.divide(
+                reference_counts_by_label,
+                boundary_counts_by_label,
+                out=np.zeros(label_lookup_size, dtype=float),
+                where=boundary_counts_by_label > 0,
+            )
+        else:
+            # CD68-like intracellular markers use the eroded internal region as
+            # their self-reference. Contact-band signal is suspicious only when
+            # distributed internal signal is absent or much weaker.
+            reference_mean_by_label = np.zeros(label_lookup_size, dtype=float)
+            reference_positive_fraction_by_label = np.zeros(label_lookup_size, dtype=float)
+            reference_counts_by_label = np.zeros(label_lookup_size, dtype=np.int64)
+            reference_valid_fraction_by_label = np.zeros(label_lookup_size, dtype=float)
+            free_reference_fraction_by_label = np.zeros(label_lookup_size, dtype=float)
+            inner_mean = pd.to_numeric(
+                feature_df[f"{prefix}_inner_nonnegative_mean"],
+                errors="coerce",
+            ).fillna(0.0).to_numpy(float)
+            inner_positive = pd.to_numeric(
+                feature_df[f"{prefix}_inner_positive_fraction"],
+                errors="coerce",
+            ).fillna(0.0).to_numpy(float)
+            inner_count = pd.to_numeric(
+                feature_df[f"{prefix}_inner_valid_pixel_count"],
+                errors="coerce",
+            ).fillna(0).to_numpy(np.int64)
+            inner_valid_fraction = pd.to_numeric(
+                feature_df[f"{prefix}_inner_valid_pixel_fraction"],
+                errors="coerce",
+            ).fillna(0.0).to_numpy(float)
+            reference_mean_by_label[labels] = inner_mean
+            reference_positive_fraction_by_label[labels] = inner_positive
+            reference_counts_by_label[labels] = inner_count
+            reference_valid_fraction_by_label[labels] = inner_valid_fraction
+            free_reference_fraction_by_label[labels] = inner_valid_fraction
+
+        source_contact_fraction_by_label = np.divide(
+            plausible_counts_by_label,
+            boundary_counts_by_label,
+            out=np.zeros(label_lookup_size, dtype=float),
+            where=boundary_counts_by_label > 0,
         )
-        grouped["source_attribution_confidence"] = (
-            grouped["dominant_source_fraction"]
-            * grouped["boundary_support"]
-            * np.clip(np.log2(grouped["neighbor_contrast"].clip(lower=1)) / 3.0, 0, 1)
+        source_supported_signal_fraction_by_label = np.divide(
+            plausible_sums_by_label,
+            boundary_sums_by_label,
+            out=np.zeros(label_lookup_size, dtype=float),
+            where=boundary_sums_by_label > 0,
+        )
+
+        plausible_count_by_label = np.zeros(label_lookup_size, dtype=np.int64)
+        if n_pairs > 0 and source_plausible.any():
+            plausible_count_by_label = np.bincount(
+                pair_focal[source_plausible],
+                minlength=label_lookup_size,
+            ).astype(np.int64)
+
+        if localization == "membrane":
+            reference_sufficient_by_label = (
+                (reference_counts_by_label >= min_reference_pixels)
+                & (reference_valid_fraction_by_label >= min_unconfounded_fraction)
+            )
+        else:
+            reference_sufficient_by_label = (
+                (reference_counts_by_label >= min_reference_pixels)
+                & (reference_valid_fraction_by_label >= min_reference_valid_fraction)
+            )
+
+        focal_reference_mean = np.zeros(n_pairs, dtype=float)
+        focal_reference_positive_fraction = np.zeros(n_pairs, dtype=float)
+        focal_reference_sufficient = np.zeros(n_pairs, dtype=bool)
+        focal_free_reference_fraction = np.zeros(n_pairs, dtype=float)
+        if n_pairs > 0:
+            focal_reference_mean = reference_mean_by_label[pair_focal]
+            focal_reference_positive_fraction = reference_positive_fraction_by_label[pair_focal]
+            focal_reference_sufficient = reference_sufficient_by_label[pair_focal]
+            focal_free_reference_fraction = free_reference_fraction_by_label[pair_focal]
+
+        interface_excess = np.maximum(
+            np.nan_to_num(pair_means, nan=0.0) - focal_reference_mean,
+            0.0,
+        )
+        source_over_reference = (
+            np.nan_to_num(source_interface_mean, nan=0.0) - focal_reference_mean
+        )
+        source_over_focal_interface = (
+            np.nan_to_num(source_interface_mean, nan=0.0)
+            - np.nan_to_num(pair_means, nan=0.0)
+        )
+
+        standard_supported = (
+            source_plausible
+            & focal_reference_sufficient
+            & (pair_counts >= min_interface_pixels)
+            & (interface_excess >= standard_excess_sd * noise_scale)
+            & (source_over_reference >= source_directionality_sd * noise_scale)
+        )
+        strong_supported = (
+            source_plausible
+            & focal_reference_sufficient
+            & (pair_counts >= min_interface_pixels)
+            & (interface_excess >= strong_excess_sd * noise_scale)
+            & (source_over_reference >= strong_excess_sd * noise_scale)
+        )
+        high_specificity_supported = (
+            standard_supported
+            & (interface_excess >= high_excess_sd * noise_scale)
+            & (source_over_focal_interface >= high_source_over_focal_sd * noise_scale)
+        )
+
+        whole_valid_count_by_label = np.zeros(label_lookup_size, dtype=float)
+        whole_valid_count = pd.to_numeric(
+            feature_df[f"{prefix}_whole_valid_pixel_count"],
+            errors="coerce",
+        ).fillna(0.0).to_numpy(float)
+        whole_valid_count_by_label[labels] = whole_valid_count
+        focal_whole_valid_count = (
+            whole_valid_count_by_label[pair_focal] if n_pairs > 0 else np.empty(0)
+        )
+        physical_pair_contamination = np.divide(
+            interface_excess * pair_counts.astype(float),
+            focal_whole_valid_count,
+            out=np.zeros(n_pairs, dtype=float),
+            where=focal_whole_valid_count > 0,
+        )
+        standard_contamination = np.where(
+            standard_supported,
+            physical_pair_contamination,
+            0.0,
+        )
+        strong_contamination = np.where(
+            strong_supported,
+            physical_pair_contamination,
+            0.0,
+        )
+        high_specificity_contamination = np.where(
+            high_specificity_supported,
+            physical_pair_contamination,
+            0.0,
+        )
+
+        excess_strength = np.clip(
+            interface_excess / max(noise_scale * 2.0, float(config["epsilon"])),
+            0.0,
+            1.0,
+        )
+        source_strength = np.clip(
+            np.maximum(source_over_reference, 0.0)
+            / max(noise_scale * 2.0, float(config["epsilon"])),
+            0.0,
+            1.0,
+        )
+        pixel_strength = np.sqrt(
+            pair_counts.astype(float) / (pair_counts.astype(float) + 4.0)
+        )
+        pair_evidence_strength = (
+            excess_strength * source_strength * pixel_strength
         ) ** (1.0 / 3.0)
-        grouped["homogeneous_neighbor_score"] = (
-            1.0 - np.clip(np.log2(grouped["neighbor_contrast"].clip(lower=1)) / 3.0, 0, 1)
+        pair_evidence_strength = np.where(source_plausible, pair_evidence_strength, 0.0)
+
+        if n_pairs > 0:
+            pair_table = pd.DataFrame(
+                {
+                    "focal_label": pair_focal,
+                    "neighbor_label": pair_neighbor,
+                    "protein": channel,
+                    "localization_class": localization,
+                    "shared_boundary_pixel_edges": pair_shared_edges,
+                    "interface_pixel_count": np.bincount(
+                        pair_inverse,
+                        minlength=n_pairs,
+                    ).astype(np.int64),
+                    "valid_interface_pixel_count": pair_counts,
+                    "focal_interface_mean": pair_means,
+                    "focal_interface_positive_fraction": pair_positive_fraction,
+                    "source_interface_mean": source_interface_mean,
+                    "source_interface_positive_fraction": source_interface_positive_fraction,
+                    "source_interface_valid_pixel_count": source_interface_valid_pixels,
+                    "focal_reference_mean": focal_reference_mean,
+                    "focal_reference_positive_fraction": focal_reference_positive_fraction,
+                    "free_reference_fraction": focal_free_reference_fraction,
+                    "interface_noise_scale": noise_scale,
+                    "source_plausible": source_plausible,
+                    "reference_sufficient": focal_reference_sufficient,
+                    "interface_excess": interface_excess,
+                    "source_over_reference": source_over_reference,
+                    "source_over_focal_interface": source_over_focal_interface,
+                    "standard_supported": standard_supported,
+                    "strong_supported": strong_supported,
+                    "high_specificity_supported": high_specificity_supported,
+                    "supported_contamination": standard_contamination,
+                    "strong_supported_contamination": strong_contamination,
+                    "high_specificity_supported_contamination": high_specificity_contamination,
+                    "pair_evidence_strength": pair_evidence_strength,
+                }
+            )
+            pair_table = pair_table.sort_values(
+                ["focal_label", "supported_contamination", "strong_supported_contamination"],
+                ascending=[True, False, False],
+            )
+            pair_table["source_rank"] = pair_table.groupby("focal_label").cumcount() + 1
+
+            grouped = pair_table.groupby("focal_label", as_index=False).agg(
+                all_neighbor_basis=("supported_contamination", "sum"),
+                strong_neighbor_basis=("strong_supported_contamination", "sum"),
+                high_specificity_basis=("high_specificity_supported_contamination", "sum"),
+                dominant_neighbor_basis=("supported_contamination", "max"),
+                strongest_neighbor_intensity=("source_interface_mean", "max"),
+                weighted_neighbor_intensity=("source_interface_mean", "mean"),
+                n_plausible_source_neighbors=("source_plausible", "sum"),
+                n_supported_interfaces=("standard_supported", "sum"),
+                n_strong_supported_interfaces=("strong_supported", "sum"),
+                n_high_specificity_interfaces=("high_specificity_supported", "sum"),
+                maximum_interface_excess=("interface_excess", "max"),
+                maximum_pair_evidence_strength=("pair_evidence_strength", "max"),
+            )
+            top_neighbor_basis = (
+                pair_table[pair_table["source_rank"] <= top_n]
+                .groupby("focal_label")["supported_contamination"]
+                .sum()
+                .rename("top_neighbor_basis")
+                .reset_index()
+            )
+            grouped = grouped.merge(top_neighbor_basis, on="focal_label", how="left")
+            dominant_rows = pair_table.drop_duplicates("focal_label", keep="first")[
+                ["focal_label", "neighbor_label"]
+            ].rename(columns={"neighbor_label": "dominant_neighbor_label"})
+            grouped = grouped.merge(dominant_rows, on="focal_label", how="left")
+            grouped["dominant_source_fraction"] = np.divide(
+                grouped["dominant_neighbor_basis"],
+                grouped["all_neighbor_basis"],
+                out=np.zeros(grouped.shape[0], dtype=float),
+                where=grouped["all_neighbor_basis"].to_numpy(float) > 0,
+            )
+
+            contribution_mode = str(config["save_neighbor_contributions"])
+            if contribution_mode != "none":
+                save_table = pair_table.copy()
+                if contribution_mode == "top":
+                    save_table = save_table[
+                        save_table["source_rank"]
+                        <= int(config["max_saved_neighbors_per_cell_protein"])
+                    ].copy()
+                contribution_records.append(save_table)
+        else:
+            grouped = pd.DataFrame(columns=["focal_label"])
+
+        per_cell = original.copy()
+        per_cell["free_reference_fraction"] = free_reference_fraction_by_label[labels]
+        per_cell["source_contact_fraction"] = source_contact_fraction_by_label[labels]
+        per_cell["source_supported_signal_fraction"] = (
+            source_supported_signal_fraction_by_label[labels]
         )
-        original = marker[["label", "intensity"]].rename(
-            columns={"label": label_col, "intensity": "original_nonnegative_intensity"}
+        per_cell["intrinsic_signal_support"] = (
+            reference_positive_fraction_by_label[labels]
         )
-        grouped = original.merge(grouped, left_on=label_col, right_on="focal_label", how="left")
-        grouped["protein"] = channel
-        grouped = grouped.drop(columns=["focal_label", "dominant_neighbor_basis_check"], errors="ignore")
-        grouped = grouped.merge(
+        per_cell["reference_sufficient"] = reference_sufficient_by_label[labels]
+        per_cell["focal_marker_positive_fraction"] = (
+            boundary_positive_fraction_by_label[labels]
+            if localization == "membrane"
+            else pd.to_numeric(
+                feature_df[f"{prefix}_whole_positive_fraction"],
+                errors="coerce",
+            ).fillna(0.0).to_numpy(float)
+        )
+
+        per_cell = per_cell.merge(
+            grouped,
+            left_on=label_col,
+            right_on="focal_label",
+            how="left",
+        ).drop(columns=["focal_label"], errors="ignore")
+
+        numeric_zero_columns = [
+            "all_neighbor_basis",
+            "strong_neighbor_basis",
+            "high_specificity_basis",
+            "dominant_neighbor_basis",
+            "top_neighbor_basis",
+            "strongest_neighbor_intensity",
+            "weighted_neighbor_intensity",
+            "dominant_source_fraction",
+            "n_plausible_source_neighbors",
+            "n_supported_interfaces",
+            "n_strong_supported_interfaces",
+            "n_high_specificity_interfaces",
+            "maximum_interface_excess",
+            "maximum_pair_evidence_strength",
+        ]
+        for column in numeric_zero_columns:
+            if column not in per_cell.columns:
+                per_cell[column] = 0.0
+            per_cell[column] = pd.to_numeric(per_cell[column], errors="coerce").fillna(0.0)
+
+        # Compatibility fields retained for downstream reports. They no longer
+        # drive the correction. ``boundary_support`` now means the fraction of
+        # focal boundary occupied by plausible marker-positive sources.
+        per_cell["source_attribution_confidence"] = per_cell[
+            "maximum_pair_evidence_strength"
+        ].clip(0, 1)
+        per_cell["boundary_support"] = per_cell["source_contact_fraction"].clip(0, 1)
+        per_cell["neighbor_contrast"] = np.divide(
+            per_cell["strongest_neighbor_intensity"].to_numpy(float),
+            np.maximum(
+                reference_mean_by_label[labels],
+                noise_scale,
+            ),
+            out=np.zeros(per_cell.shape[0], dtype=float),
+            where=np.maximum(reference_mean_by_label[labels], noise_scale) > 0,
+        )
+        per_cell["homogeneous_neighbor_score"] = 0.0
+
+        plausible_sources = per_cell["n_plausible_source_neighbors"].to_numpy(float) > 0
+        focal_signal_present = (
+            per_cell["focal_marker_positive_fraction"].to_numpy(float)
+            >= ambiguity_positive_fraction
+        )
+        reference_sufficient = per_cell["reference_sufficient"].astype(bool).to_numpy()
+        if localization == "membrane":
+            ambiguity = (
+                plausible_sources
+                & focal_signal_present
+                & ~reference_sufficient
+                & (
+                    per_cell["source_contact_fraction"].to_numpy(float)
+                    >= ambiguity_contact_fraction
+                )
+            )
+            ambiguity_reason = np.where(
+                ambiguity,
+                "insufficient_unconfounded_membrane_reference",
+                "",
+            )
+        else:
+            ambiguity = plausible_sources & focal_signal_present & ~reference_sufficient
+            ambiguity_reason = np.where(
+                ambiguity,
+                "insufficient_intracellular_reference",
+                "",
+            )
+
+        reference_quality = np.full(per_cell.shape[0], "good", dtype=object)
+        reference_quality[~plausible_sources] = "not_needed_no_plausible_source"
+        limited = (
+            plausible_sources
+            & reference_sufficient
+            & (
+                per_cell["free_reference_fraction"].to_numpy(float)
+                < float(config["good_reference_fraction"])
+            )
+        )
+        reference_quality[limited] = "limited"
+        reference_quality[plausible_sources & ~reference_sufficient] = "insufficient"
+
+        per_cell["reference_quality"] = reference_quality
+        per_cell["intrinsic_vs_neighbor_signal_ambiguous"] = ambiguity
+        per_cell["ambiguity_reason"] = ambiguity_reason
+        per_cell = per_cell.merge(
             geometry_df[[label_col, "dense_small_cell_score", "dense_small_cell_flag"]],
             on=label_col,
             how="left",
             validate="one_to_one",
         )
-        fill_zero = [
-            "all_neighbor_basis", "dominant_neighbor_basis", "top_neighbor_basis",
-            "strongest_neighbor_intensity", "weighted_neighbor_intensity",
-            "dominant_source_fraction", "source_attribution_confidence",
-            "neighbor_contrast", "boundary_support", "homogeneous_neighbor_score",
-            "dense_small_cell_score",
-        ]
-        grouped[fill_zero] = grouped[fill_zero].fillna(0.0)
-        evidence_records.append(grouped)
-
-        contribution_mode = str(config["save_neighbor_contributions"])
-        if contribution_mode != "none":
-            if contribution_mode == "top":
-                edges = edges[edges["source_rank"] <= int(config["max_saved_neighbors_per_cell_protein"])]
-            contribution_records.append(
-                edges[[
-                    "focal_label", "neighbor_label", "protein", "shared_boundary_pixel_edges",
-                    "focal_shared_fraction", "focal_intensity", "neighbor_intensity",
-                    "neighbor_contrast", "boundary_support", "raw_contribution", "source_rank",
-                ]].copy()
-            )
+        per_cell["dense_small_cell_score"] = pd.to_numeric(
+            per_cell["dense_small_cell_score"],
+            errors="coerce",
+        ).fillna(0.0)
+        evidence_records.append(per_cell)
 
     evidence_df = pd.concat(evidence_records, ignore_index=True)
     contributions_df = (
         pd.concat(contribution_records, ignore_index=True)
-        if contribution_records else pd.DataFrame()
+        if contribution_records
+        else pd.DataFrame()
     )
+
+    if logger is not None:
+        present_correction_channels = [
+            channel for channel in channels if channel in correction_channels
+        ]
+        missing_requested = sorted(correction_channels - set(channels))
+        logger.info(
+            "Pairwise interface correction evaluated %s selected correction channels: %s",
+            len(present_correction_channels),
+            present_correction_channels,
+        )
+        if missing_requested:
+            logger.warning(
+                "Configured correction channels absent from this image selection and "
+                "therefore not corrected: %s",
+                missing_requested,
+            )
+        logger.info(
+            "Marker-attribution ambiguity flags: %s cell-marker pairs.",
+            int(evidence_df["intrinsic_vs_neighbor_signal_ambiguous"].sum()),
+        )
+        logger.info("Interface geometry diagnostics: %s", interface_diagnostics)
+
     return evidence_df, contributions_df
 
 
@@ -3799,209 +4795,253 @@ def evaluate_correction_scenarios(
     evidence_df: pd.DataFrame,
     config: Mapping[str, Any],
 ) -> pd.DataFrame:
-    """Generate all configured correction scenarios from reusable evidence.
+    """Generate every configured correction method from physical interface evidence.
 
-    Each scenario is a lightweight transformation of the same source-attribution
-    basis. The output remains long format so new scenarios can be added without
-    changing the internal data model.
+    The seven scenario names are retained for downstream compatibility and for
+    violin-plot sensitivity analysis. They no longer compete as unrelated
+    heuristic models. Each scenario is a transparent view of one or more
+    physically supported pairwise interface contributions.
     """
     rows: list[pd.DataFrame] = []
     scenarios = list(config["correction_scenarios"])
     shrinkage = config["scenario_shrinkage"]
     caps = config["scenario_max_fraction_removed"]
-    dense_strength = float(config["dense_protection_strength"])
-    high_spec_min = float(config["high_specificity_minimum_evidence"])
 
     for scenario in scenarios:
         temp = evidence_df.copy()
+        eligible = temp["correction_eligible"].fillna(False).astype(bool)
+
         if scenario == "none":
             basis = np.zeros(temp.shape[0], dtype=float)
+            applicable = pd.Series(True, index=temp.index)
+        elif scenario == "conservative":
+            basis = temp["all_neighbor_basis"].to_numpy(float)
+            applicable = eligible & (temp["n_supported_interfaces"] > 0)
+        elif scenario == "medium":
+            basis = temp["all_neighbor_basis"].to_numpy(float)
+            applicable = eligible & (temp["n_supported_interfaces"] > 0)
+        elif scenario == "strong":
+            basis = temp["strong_neighbor_basis"].to_numpy(float)
+            applicable = eligible & (temp["n_strong_supported_interfaces"] > 0)
         elif scenario == "dominant_neighbor":
             basis = temp["dominant_neighbor_basis"].to_numpy(float)
+            applicable = eligible & (temp["dominant_neighbor_basis"] > 0)
         elif scenario == "top_neighbors":
             basis = temp["top_neighbor_basis"].to_numpy(float)
+            applicable = eligible & (temp["top_neighbor_basis"] > 0)
+        elif scenario == "high_specificity":
+            basis = temp["high_specificity_basis"].to_numpy(float)
+            applicable = eligible & (temp["n_high_specificity_interfaces"] > 0)
         else:
-            basis = temp["all_neighbor_basis"].to_numpy(float)
+            raise ValueError(f"Unsupported correction scenario: {scenario!r}.")
 
-        evidence_strength = (
-            temp["source_attribution_confidence"].clip(0, 1)
-            * (0.25 + 0.75 * temp["boundary_support"].clip(0, 1))
-        )
-        if scenario == "high_specificity":
-            applicable = evidence_strength >= high_spec_min
-        elif scenario == "strong":
-            applicable = (
-                temp["neighbor_contrast"] >= float(config["strong_neighbor_focal_contrast"])
-            ) & (temp["source_attribution_confidence"] >= 0.35)
-        else:
-            applicable = pd.Series(True, index=temp.index)
+        estimated = np.maximum(basis, 0.0) * float(shrinkage[scenario])
+        estimated = np.where(applicable.to_numpy(bool), estimated, 0.0)
 
-        dense_protection = 1.0 - dense_strength * temp["dense_small_cell_score"].clip(0, 1)
-        if scenario in {"strong", "dominant_neighbor"}:
-            dense_protection = 1.0 - 0.35 * dense_strength * temp["dense_small_cell_score"].clip(0, 1)
-        if scenario == "none":
-            dense_protection = pd.Series(1.0, index=temp.index)
+        original_nonnegative = temp["original_nonnegative_intensity"].clip(lower=0).to_numpy(float)
+        original_signed = pd.to_numeric(
+            temp["original_signed_intensity"],
+            errors="coerce",
+        ).fillna(0.0).to_numpy(float)
 
-        estimated = basis * float(shrinkage[scenario]) * evidence_strength * dense_protection
-        estimated = np.where(applicable, estimated, 0.0)
-        original = temp["original_nonnegative_intensity"].clip(lower=0).to_numpy(float)
-        cap = original * float(caps[scenario])
-        estimated = np.minimum(np.maximum(estimated, 0.0), cap)
-        corrected_signed = original - estimated
+        # Scenario caps are retained only as secondary emergency guardrails.
+        # The primary limit is the physical interface-supported basis itself.
+        cap = original_nonnegative * float(caps[scenario])
+        estimated = np.minimum(estimated, cap)
+        estimated = np.minimum(estimated, original_nonnegative)
+
+        corrected_signed = original_signed - estimated
+        corrected_nonnegative = np.maximum(original_nonnegative - estimated, 0.0)
 
         temp["scenario"] = scenario
         temp["scenario_applicable"] = applicable.to_numpy(bool)
         temp["estimated_contamination"] = estimated
         temp["fraction_removed"] = np.divide(
-            estimated, original,
+            estimated,
+            original_nonnegative,
             out=np.zeros_like(estimated, dtype=float),
-            where=original > float(config["epsilon"]),
+            where=original_nonnegative > float(config["epsilon"]),
         )
         temp["corrected_value_signed"] = corrected_signed
-        temp["corrected_value_nonnegative"] = np.maximum(corrected_signed, 0.0)
-        temp["scenario_confidence"] = (
-            evidence_strength
-            * (1.0 - 0.5 * temp["dense_small_cell_score"].clip(0, 1))
-            * applicable.astype(float)
-        ).clip(0, 1)
-        temp["scenario_not_applicable_reason"] = np.where(
-            applicable, "", "scenario_evidence_requirements_not_met"
+        temp["corrected_value_nonnegative"] = corrected_nonnegative
+        evidence_strength = temp["maximum_pair_evidence_strength"].clip(0, 1).to_numpy(float)
+        temp["scenario_confidence"] = np.where(
+            applicable.to_numpy(bool),
+            evidence_strength,
+            0.0,
         )
+
+        not_applicable_reason = np.full(temp.shape[0], "", dtype=object)
+        not_selected = ~eligible.to_numpy(bool)
+        not_applicable_reason[not_selected] = "marker_not_selected_for_correction"
+        unsupported = (
+            eligible.to_numpy(bool)
+            & ~applicable.to_numpy(bool)
+            & (scenario != "none")
+        )
+        not_applicable_reason[unsupported] = "scenario_interface_evidence_requirements_not_met"
+        temp["scenario_not_applicable_reason"] = not_applicable_reason
         rows.append(temp)
 
-    output = pd.concat(rows, ignore_index=True)
-    return output
+    return pd.concat(rows, ignore_index=True)
 
 
 def recommend_correction_scenario(
     scenario_df: pd.DataFrame,
     config: Mapping[str, Any],
 ) -> pd.DataFrame:
-    """Select and explain the suggested correction for each cell-protein pair."""
+    """Choose a preservation-first automatic recommendation.
+
+    Automatic recommendations are deliberately limited to ``none``,
+    ``conservative``, and ``medium``. Strong, dominant-neighbor, top-neighbor,
+    and high-specificity results remain fully saved as sensitivity analyses but
+    cannot win merely through heuristic score bonuses.
+    """
     label_col = str(config["cell_label_col"])
+    intrinsic_threshold = float(config["recommendation_intrinsic_support_threshold"])
     records: list[dict[str, Any]] = []
 
     for (label, protein), group in scenario_df.groupby([label_col, "protein"], sort=False):
         group = group.copy()
-        original = float(group["original_nonnegative_intensity"].iloc[0])
-        dense = float(group["dense_small_cell_score"].iloc[0])
-        contrast = float(group["neighbor_contrast"].iloc[0])
-        source_conf = float(group["source_attribution_confidence"].iloc[0])
-        boundary = float(group["boundary_support"].iloc[0])
-        dominant_fraction = float(group["dominant_source_fraction"].iloc[0])
-        homogeneous = float(group["homogeneous_neighbor_score"].iloc[0])
+        first = group.iloc[0]
+        eligible = bool(first["correction_eligible"])
+        ambiguous = bool(first["intrinsic_vs_neighbor_signal_ambiguous"])
+        n_supported = int(first["n_supported_interfaces"])
+        intrinsic_support = float(first["intrinsic_signal_support"])
+        reference_quality = str(first["reference_quality"])
+        source_conf = float(first["maximum_pair_evidence_strength"])
+        source_contact_fraction = float(first["source_contact_fraction"])
+        free_reference_fraction = float(first["free_reference_fraction"])
+        original_nonnegative = float(first["original_nonnegative_intensity"])
 
-        scores: dict[str, float] = {}
-        for row in group.itertuples(index=False):
-            name = str(row.scenario)
-            if not bool(row.scenario_applicable):
-                scores[name] = -np.inf
-                continue
-            fraction_removed = float(row.fraction_removed)
-            score = float(row.scenario_confidence)
-            if name == "none":
-                score = 1.0 - min(1.0, source_conf * boundary * np.clip(np.log2(max(contrast, 1.0)) / 3.0, 0, 1))
-            elif name == "conservative":
-                score += 0.60 * dense + 0.25 * homogeneous
-            elif name == "medium":
-                score += 0.25 * source_conf + 0.15 * boundary - 0.20 * dense
-            elif name == "strong":
-                score += 0.40 * source_conf + 0.30 * boundary + 0.20 * dominant_fraction - 0.45 * dense
-            elif name == "dominant_neighbor":
-                score += 0.45 * dominant_fraction + 0.25 * boundary - 0.15 * dense
-            elif name == "top_neighbors":
-                score += 0.20 * source_conf + 0.15 * (1.0 - dominant_fraction) - 0.20 * dense
-            elif name == "high_specificity":
-                score += 0.35 * source_conf + 0.35 * boundary
-            if fraction_removed > float(config["overcorrection_fraction_warning"]):
-                score -= 0.50 * (fraction_removed - float(config["overcorrection_fraction_warning"]))
-            scores[name] = float(score)
-
-        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        best_name, best_score = ordered[0]
-        second_name, second_score = ordered[1] if len(ordered) > 1 else ("", -np.inf)
-        margin = best_score - second_score if np.isfinite(second_score) else 1.0
-        unresolved = (
-            not np.isfinite(best_score)
-            or margin < float(config["recommendation_minimum_margin"])
-            or best_score < float(config["recommendation_minimum_confidence"])
-        )
-
-        chosen = group[group["scenario"] == best_name].iloc[0] if not unresolved else None
-        reason_codes: list[str] = []
-        if dense >= 0.65:
-            reason_codes.append("high_dense_small_cell_geometry")
-        if homogeneous >= 0.65:
-            reason_codes.append("multiple_similar_intensity_neighbors")
-        if dominant_fraction >= 0.60:
-            reason_codes.append("single_dominant_neighbor")
-        if contrast >= float(config["strong_neighbor_focal_contrast"]):
-            reason_codes.append("high_neighbor_focal_contrast")
-        if boundary >= 0.60:
-            reason_codes.append("boundary_localized_signal")
-        if source_conf < float(config["minimum_source_attribution_confidence"]):
-            reason_codes.append("weak_source_attribution")
-        if unresolved:
-            reason_codes.append("scenario_selection_unresolved")
+        if not eligible:
+            selected = "none"
+            reason_codes = ["marker_not_selected_for_correction", "selected_none_correction"]
+        elif ambiguous:
+            # When the image cannot distinguish intrinsic from neighbor-derived
+            # signal, preserve the measurement. The dedicated ambiguity flag is
+            # what sends biologically consequential cases to downstream review.
+            selected = "none"
+            reason_codes = [
+                "intrinsic_vs_neighbor_signal_ambiguous",
+                str(first.get("ambiguity_reason", "insufficient_reference")),
+                "preservation_first",
+                "selected_none_correction",
+            ]
+        elif n_supported == 0:
+            selected = "none"
+            reason_codes = ["no_supported_contaminating_interface", "selected_none_correction"]
+        elif (
+            intrinsic_support >= intrinsic_threshold
+            or reference_quality == "limited"
+        ):
+            selected = "conservative"
+            reason_codes = [
+                "supported_interface_contamination",
+                "intrinsic_focal_signal_present",
+                "selected_conservative_correction",
+            ]
         else:
-            reason_codes.append(f"selected_{best_name}_correction")
+            selected = "medium"
+            reason_codes = [
+                "clear_interface_localized_contamination",
+                "adequate_focal_reference",
+                "selected_medium_correction",
+            ]
 
-        if unresolved:
-            suggested_scenario = "unresolved"
-            suggested_value = np.nan
-            estimated_contamination = np.nan
-            fraction_removed = np.nan
-            explanation = (
-                "No correction scenario was recommended because the leading "
-                f"scenarios were insufficiently separated (margin={margin:.3f}) "
-                "or the supporting evidence was weak."
+        chosen_rows = group[group["scenario"] == selected]
+        if chosen_rows.empty:
+            raise RuntimeError(
+                f"Recommended scenario {selected!r} was not present for "
+                f"cell {label}, marker {protein}."
             )
+        chosen = chosen_rows.iloc[0]
+
+        suggested_value_signed = float(chosen["corrected_value_signed"])
+        suggested_value_nonnegative = float(chosen["corrected_value_nonnegative"])
+        estimated_contamination = float(chosen["estimated_contamination"])
+        fraction_removed = float(chosen["fraction_removed"])
+
+        if selected == "none":
+            second_best = "conservative" if n_supported > 0 else ""
+        elif selected == "conservative":
+            second_best = "medium"
         else:
-            suggested_scenario = best_name
-            suggested_value = float(chosen["corrected_value_signed"])
-            estimated_contamination = float(chosen["estimated_contamination"])
-            fraction_removed = float(chosen["fraction_removed"])
-            explanation = (
-                f"{best_name.replace('_', ' ').title()} correction selected for {protein}. "
-                f"Dense-small-cell score={dense:.3f}, strongest neighbor/focal contrast="
-                f"{contrast:.3f}, boundary support={boundary:.3f}, dominant-source "
-                f"fraction={dominant_fraction:.3f}, and estimated fraction removed="
-                f"{fraction_removed:.3f}."
-            )
+            second_best = "conservative"
+
+        reference_factor = {
+            "good": 1.0,
+            "limited": 0.7,
+            "not_needed_no_plausible_source": 1.0,
+            "insufficient": 0.25,
+        }.get(reference_quality, 0.5)
+        recommendation_confidence = float(np.clip(source_conf * reference_factor, 0, 1))
+        if selected == "none" and n_supported == 0 and not ambiguous:
+            recommendation_confidence = float(np.clip(1.0 - source_conf, 0, 1))
+        if ambiguous:
+            recommendation_confidence = 0.0
 
         overcorrection_risk = float(np.clip(
-            0.45 * dense
-            + 0.25 * homogeneous
-            + 0.20 * (fraction_removed if np.isfinite(fraction_removed) else 0.0)
-            + 0.10 * (1.0 - source_conf),
+            0.55 * intrinsic_support
+            + 0.30 * source_contact_fraction
+            + 0.15 * (1.0 if ambiguous else 0.0),
             0,
             1,
         ))
-        recommendation_confidence = float(np.clip(margin, 0, 1)) if not unresolved else 0.0
+        bleeding_existence_confidence = float(np.clip(source_conf, 0, 1))
 
-        records.append({
-            label_col: label,
-            "protein": protein,
-            "original_nonnegative_intensity": original,
-            "suggested_scenario": suggested_scenario,
-            "suggested_corrected_value_signed": suggested_value,
-            "suggested_corrected_value_nonnegative": (
-                max(suggested_value, 0.0) if np.isfinite(suggested_value) else np.nan
-            ),
-            "suggested_estimated_contamination": estimated_contamination,
-            "suggested_fraction_removed": fraction_removed,
-            "second_best_scenario": second_name,
-            "scenario_selection_margin": margin,
-            "bleeding_existence_confidence": float(np.clip(source_conf * max(boundary, 0.25), 0, 1)),
-            "source_attribution_confidence": source_conf,
-            "recommendation_confidence": recommendation_confidence,
-            "overcorrection_risk": overcorrection_risk,
-            "dense_small_cell_score": dense,
-            "annotation_mode": str(config["annotation_mode"]),
-            "annotation_influenced_recommendation": False,
-            "suggestion_reason_codes": ";".join(reason_codes),
-            "suggestion_reason_text": explanation,
-        })
+        explanation = (
+            f"{selected.replace('_', ' ').title()} correction selected for {protein}. "
+            f"Supported interfaces={n_supported}, reference quality={reference_quality}, "
+            f"free-reference fraction={free_reference_fraction:.3f}, source-contact "
+            f"fraction={source_contact_fraction:.3f}, intrinsic-signal support="
+            f"{intrinsic_support:.3f}, interface evidence={source_conf:.3f}, and "
+            f"fraction removed={fraction_removed:.3f}."
+        )
+        if ambiguous:
+            explanation += (
+                " The marker was preserved because the image does not provide "
+                "enough independent focal-cell reference signal to distinguish "
+                "intrinsic expression from neighbor-derived signal."
+            )
+
+        records.append(
+            {
+                label_col: label,
+                "protein": protein,
+                "original_nonnegative_intensity": original_nonnegative,
+                "original_signed_intensity": float(first["original_signed_intensity"]),
+                "suggested_scenario": selected,
+                "suggested_corrected_value_signed": suggested_value_signed,
+                "suggested_corrected_value_nonnegative": suggested_value_nonnegative,
+                "suggested_estimated_contamination": estimated_contamination,
+                "suggested_fraction_removed": fraction_removed,
+                "second_best_scenario": second_best,
+                "scenario_selection_margin": np.nan,
+                "bleeding_existence_confidence": bleeding_existence_confidence,
+                "source_attribution_confidence": source_conf,
+                "recommendation_confidence": recommendation_confidence,
+                "recommendation_confidence_is_calibrated": False,
+                "overcorrection_risk": overcorrection_risk,
+                "dense_small_cell_score": float(first["dense_small_cell_score"]),
+                "correction_eligible": eligible,
+                "localization_class": str(first["localization_class"]),
+                "n_plausible_source_neighbors": int(first["n_plausible_source_neighbors"]),
+                "n_supported_interfaces": n_supported,
+                "n_high_specificity_interfaces": int(first["n_high_specificity_interfaces"]),
+                "free_reference_fraction": free_reference_fraction,
+                "source_contact_fraction": source_contact_fraction,
+                "source_supported_signal_fraction": float(first["source_supported_signal_fraction"]),
+                "intrinsic_signal_support": intrinsic_support,
+                "reference_quality": reference_quality,
+                "intrinsic_vs_neighbor_signal_ambiguous": ambiguous,
+                "ambiguity_reason": str(first.get("ambiguity_reason", "")),
+                "annotation_mode": str(config["annotation_mode"]),
+                "annotation_influenced_recommendation": False,
+                "suggestion_reason_codes": ";".join(reason_codes),
+                "suggestion_reason_text": explanation,
+            }
+        )
 
     return pd.DataFrame.from_records(records)
 
@@ -4023,25 +5063,58 @@ def pivot_correction_outputs_for_anndata(
         ("fraction_removed", "fraction_removed"),
         ("scenario_confidence", "scenario_confidence"),
     ):
-        pivot = scenario.pivot(index=label_col, columns=["safe_protein", "scenario"], values=field)
-        pivot.columns = [f"protein_{protein}_{scenario_name}_{suffix}" for protein, scenario_name in pivot.columns]
+        pivot = scenario.pivot(
+            index=label_col,
+            columns=["safe_protein", "scenario"],
+            values=field,
+        )
+        pivot.columns = [
+            f"protein_{protein}_{scenario_name}_{suffix}"
+            for protein, scenario_name in pivot.columns
+        ]
         wide_parts.append(pivot)
 
     rec = recommendation_df.copy()
     rec["safe_protein"] = rec["protein"].map(make_safe_name)
-    for field, suffix in (
+    numeric_rec_fields = (
         ("suggested_corrected_value_signed", "suggested_corrected_signed"),
         ("suggested_corrected_value_nonnegative", "suggested_corrected_nonnegative"),
         ("suggested_fraction_removed", "suggested_fraction_removed"),
         ("recommendation_confidence", "recommendation_confidence"),
         ("overcorrection_risk", "overcorrection_risk"),
         ("dense_small_cell_score", "dense_small_cell_score"),
-    ):
+        ("n_plausible_source_neighbors", "n_plausible_source_neighbors"),
+        ("n_supported_interfaces", "n_supported_interfaces"),
+        ("n_high_specificity_interfaces", "n_high_specificity_interfaces"),
+        ("free_reference_fraction", "free_reference_fraction"),
+        ("source_contact_fraction", "source_contact_fraction"),
+        ("source_supported_signal_fraction", "source_supported_signal_fraction"),
+        ("intrinsic_signal_support", "intrinsic_signal_support"),
+    )
+    for field, suffix in numeric_rec_fields:
         pivot = rec.pivot(index=label_col, columns="safe_protein", values=field)
         pivot.columns = [f"protein_{protein}_{suffix}" for protein in pivot.columns]
         wide_parts.append(pivot)
-    result = pd.concat(wide_parts, axis=1).reset_index()
-    return result
+
+    ambiguity_numeric = rec.copy()
+    ambiguity_numeric["intrinsic_vs_neighbor_signal_ambiguous"] = (
+        ambiguity_numeric["intrinsic_vs_neighbor_signal_ambiguous"]
+        .fillna(False)
+        .astype(np.int8)
+    )
+    pivot = ambiguity_numeric.pivot(
+        index=label_col,
+        columns="safe_protein",
+        values="intrinsic_vs_neighbor_signal_ambiguous",
+    )
+    pivot.columns = [
+        f"protein_{protein}_intrinsic_vs_neighbor_signal_ambiguous"
+        for protein in pivot.columns
+    ]
+    wide_parts.append(pivot)
+
+    return pd.concat(wide_parts, axis=1).reset_index()
+
 
 
 def make_correction_qc_plots(
@@ -4294,6 +5367,7 @@ def main(config: Optional[Mapping[str, Any]] = None):
     outdir.mkdir(parents=True, exist_ok=True)
     logger = setup_logging(outdir, config["log_filename"])
     logger.info("Script version: %s", SCRIPT_FIX_VERSION)
+    logger.info("Correction algorithm version: %s", CORRECTION_ALGORITHM_VERSION)
     logger.info("Python executable: %s", sys.executable)
     logger.info("Active site-packages: %s", ACTIVE_SITE_PACKAGES)
     logger.info("typing_extensions: %s", typing_extensions.__file__)
@@ -5083,8 +6157,14 @@ def main(config: Optional[Mapping[str, Any]] = None):
                 feature_df=feature_df,
                 contact_df=contact_df,
                 geometry_df=geometry_density_df,
+                analysis_cyx=analysis_cyx,
+                signal_cyx=signal_cyx,
+                valid_pixel_cyx=valid_pixel_cyx,
+                segmentation_yx=segmentation_yx,
+                threshold_df=threshold_df,
                 channel_names=channel_names,
                 config=config,
+                logger=logger,
             )
             exposure_path = save_dataframe_with_fallback(exposure_df, exposure_output, logger)
             outputs = [exposure_path]
@@ -5181,7 +6261,9 @@ def main(config: Optional[Mapping[str, Any]] = None):
                 [recommendation_path, wide_path],
                 details={
                     "n_recommendations": int(recommendation_df.shape[0]),
-                    "unresolved": int((recommendation_df["suggested_scenario"] == "unresolved").sum()),
+                    "neighbor_confounded_ambiguous": int(
+                        recommendation_df["intrinsic_vs_neighbor_signal_ambiguous"].sum()
+                    ),
                 },
             )
 
@@ -5205,23 +6287,24 @@ def main(config: Optional[Mapping[str, Any]] = None):
         # ---------------------------------------------------------------------
         active_stage = "12_roi_h5ad"
         h5ad_path = roi_outdir / f"roi_with_spillover_features_{safe_roi}.h5ad"
-        stage08_context = {
+        stage12_context = {
             "selected_roi": selected_roi,
             "n_roi_obs": int(roi_adata.n_obs),
             "n_feature_rows": int(feature_df.shape[0]),
+            "n_correction_columns": int(correction_wide_df.shape[1]),
         }
-        stage08_signature = build_stage_signature(
+        stage12_signature = build_stage_signature(
             config,
             active_stage,
-            runtime_context=stage08_context,
-            upstream_signature=stage07_signature,
+            runtime_context=stage12_context,
+            upstream_signature=stage11_signature,
         )
 
         if config["save_roi_h5ad"]:
             if checkpoint_is_valid(
                 checkpoint_dir,
                 active_stage,
-                stage08_signature,
+                stage12_signature,
                 required_paths=[h5ad_path],
                 config=config,
                 forced_stages=forced_stages,
@@ -5242,7 +6325,7 @@ def main(config: Optional[Mapping[str, Any]] = None):
                 mark_checkpoint_complete(
                     checkpoint_dir,
                     active_stage,
-                    stage08_signature,
+                    stage12_signature,
                     output_paths=[h5ad_path],
                     details={
                         "n_obs": int(roi_adata_with_features.n_obs),
@@ -5264,7 +6347,7 @@ def main(config: Optional[Mapping[str, Any]] = None):
             mark_checkpoint_complete(
                 checkpoint_dir,
                 active_stage,
-                stage08_signature,
+                stage12_signature,
                 output_paths=[disabled_path],
                 details={"disabled": True},
             )
@@ -5275,23 +6358,23 @@ def main(config: Optional[Mapping[str, Any]] = None):
         active_stage = "13_qc_plots"
         qc_dir = roi_outdir / "qc_plots"
         qc_manifest_path = checkpoint_dir / f"qc_manifest_{safe_roi}.json"
-        stage09_context = {
+        stage13_context = {
             "selected_roi": selected_roi,
             "channel_names": list(channel_names),
             "n_qc_channels": int(config["n_qc_channels"]),
             "n_feature_rows": int(feature_df.shape[0]),
         }
-        stage09_signature = build_stage_signature(
+        stage13_signature = build_stage_signature(
             config,
             active_stage,
-            runtime_context=stage09_context,
-            upstream_signature=stage08_signature,
+            runtime_context=stage13_context,
+            upstream_signature=stage12_signature,
         )
 
         if checkpoint_is_valid(
             checkpoint_dir,
             active_stage,
-            stage09_signature,
+            stage13_signature,
             required_paths=[qc_dir, qc_manifest_path],
             config=config,
             forced_stages=forced_stages,
@@ -5333,7 +6416,7 @@ def main(config: Optional[Mapping[str, Any]] = None):
             mark_checkpoint_complete(
                 checkpoint_dir,
                 active_stage,
-                stage09_signature,
+                stage13_signature,
                 output_paths=[qc_dir, qc_manifest_path],
                 details={"n_qc_files": len(qc_files)},
             )
@@ -5353,23 +6436,26 @@ def main(config: Optional[Mapping[str, Any]] = None):
         active_stage = "14_summary"
         summary_path = roi_outdir / f"spillover_summary_{safe_roi}.json"
         run_complete_path = roi_outdir / "RUN_COMPLETE.json"
-        stage10_context = {
+        stage14_context = {
             "selected_roi": selected_roi,
             "n_features": int(merged_feature_df.shape[0]),
             "n_contacts": int(contact_df.shape[0]),
             "channel_names": list(channel_names),
+            "n_ambiguous_cell_markers": int(
+                recommendation_df["intrinsic_vs_neighbor_signal_ambiguous"].sum()
+            ),
         }
-        stage10_signature = build_stage_signature(
+        stage14_signature = build_stage_signature(
             config,
             active_stage,
-            runtime_context=stage10_context,
-            upstream_signature=stage09_signature,
+            runtime_context=stage14_context,
+            upstream_signature=stage13_signature,
         )
 
         if checkpoint_is_valid(
             checkpoint_dir,
             active_stage,
-            stage10_signature,
+            stage14_signature,
             required_paths=[summary_path, run_complete_path],
             config=config,
             forced_stages=forced_stages,
@@ -5400,7 +6486,13 @@ def main(config: Optional[Mapping[str, Any]] = None):
                 "n_direct_contact_pairs": int(contact_df.shape[0]),
                 "n_correction_scenario_rows": int(scenario_df.shape[0]),
                 "n_recommendations": int(recommendation_df.shape[0]),
-                "n_unresolved_recommendations": int((recommendation_df["suggested_scenario"] == "unresolved").sum()),
+                "n_unresolved_recommendations": 0,
+                "n_neighbor_confounded_ambiguous_cell_markers": int(
+                    recommendation_df["intrinsic_vs_neighbor_signal_ambiguous"].sum()
+                ),
+                "correction_algorithm_version": CORRECTION_ALGORITHM_VERSION,
+                "correction_channels": list(config["correction_channels"]),
+                "marker_localization": dict(config["marker_localization"]),
                 "correction_scenarios": list(config["correction_scenarios"]),
                 "annotation_mode": str(config["annotation_mode"]),
                 "checkpoint_stage_order": list(CHECKPOINT_STAGE_ORDER),
@@ -5413,14 +6505,14 @@ def main(config: Optional[Mapping[str, Any]] = None):
                     "completed_at_utc": utc_now_iso(),
                     "selected_roi": selected_roi,
                     "summary": str(summary_path),
-                    "final_stage_signature": stage10_signature,
+                    "final_stage_signature": stage14_signature,
                 },
                 run_complete_path,
             )
             mark_checkpoint_complete(
                 checkpoint_dir,
                 active_stage,
-                stage10_signature,
+                stage14_signature,
                 output_paths=[summary_path, run_complete_path],
                 details=crop_summary,
             )
@@ -5556,6 +6648,7 @@ def _build_run_config(args: argparse.Namespace) -> dict[str, Any]:
         "background_sigma": "background_gaussian_sigma_pixels",
         "inner_erosion": "inner_erosion_pixels",
         "outer_ring": "outer_ring_pixels",
+        "interface_band": "interface_band_pixels",
         "threshold_quantile": "default_threshold_quantile",
         "angular_sectors": "angular_sectors",
         "sector_positive_fraction": "sector_positive_fraction",
@@ -5590,6 +6683,7 @@ def _build_run_config(args: argparse.Namespace) -> dict[str, Any]:
 
     repeated_mapping = {
         "channel": "analysis_channels",
+        "correction_channel": "correction_channels",
         "exclude_channel": "exclude_channels",
         "shape_element": "cell_shape_candidates",
         "metadata_column": "metadata_columns",
@@ -5606,6 +6700,12 @@ def _build_run_config(args: argparse.Namespace) -> dict[str, Any]:
     quantiles = _parse_key_value_items(args.channel_threshold_quantile, float)
     if quantiles is not None:
         config["channel_threshold_quantiles"] = quantiles
+
+    marker_localization = _parse_key_value_items(args.marker_localization, str)
+    if marker_localization is not None:
+        existing_localization = dict(config.get("marker_localization", {}))
+        existing_localization.update(marker_localization)
+        config["marker_localization"] = existing_localization
 
     return finalize_config(config)
 
@@ -5739,6 +6839,22 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Image channel to analyze; repeatable. Omit for all non-excluded channels.",
     )
     run_parser.add_argument(
+        "--correction-channel",
+        action="append",
+        help=(
+            "Marker to spillover-correct; repeatable. Other analyzed markers are "
+            "measured and saved unchanged."
+        ),
+    )
+    run_parser.add_argument(
+        "--marker-localization",
+        action="append",
+        help=(
+            "Correction-marker localization as NAME=membrane, "
+            "NAME=intracellular, or NAME=nuclear; repeatable."
+        ),
+    )
+    run_parser.add_argument(
         "--exclude-channel",
         action="append",
         help="Channel to exclude; repeatable.",
@@ -5776,6 +6892,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--background-sigma", type=float, help="Gaussian background sigma in native pixels.")
     run_parser.add_argument("--inner-erosion", type=int, help="Interior erosion radius in native pixels.")
     run_parser.add_argument("--outer-ring", type=int, help="External ring radius in native pixels.")
+    run_parser.add_argument(
+        "--interface-band",
+        type=int,
+        help="Inward width in native pixels for pairwise cell-cell interface bands.",
+    )
     run_parser.add_argument("--manual-threshold", action="append", help="Channel threshold as NAME=VALUE; repeatable.")
     run_parser.add_argument("--threshold-quantile", type=float, help="Default within-cell signal threshold quantile.")
     run_parser.add_argument("--channel-threshold-quantile", action="append", help="Channel-specific quantile as NAME=VALUE; repeatable.")
@@ -5803,8 +6924,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
     _add_boolean_argument(run_parser, "--save-roi-h5ad", "Save or omit the ROI AnnData output.")
     run_parser.add_argument(
         "--annotation-mode",
-        choices=["disabled", "reporting_only", "validation_only", "weak_prior"],
-        help="Optional annotation behavior. Correction is annotation-free by default.",
+        choices=["disabled", "reporting_only", "validation_only"],
+        help="Optional annotation retention. Correction itself is always annotation-free.",
     )
     run_parser.add_argument("--top-neighbors-n", type=int)
     run_parser.add_argument("--minimum-neighbor-focal-contrast", type=float)
